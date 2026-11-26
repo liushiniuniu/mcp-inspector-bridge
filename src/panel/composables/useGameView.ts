@@ -175,6 +175,7 @@ export function useGameView(
         logBridge(`switchRunMode 触发 | 目标模式: ${newMode}`);
         globalState.isSwitchingMode = true;
         globalState.runMode = newMode;
+        saveRunMode();
         globalState.nodeTree = null;
         globalState.nodeDetail = null;
 
@@ -456,10 +457,70 @@ export function useGameView(
         } catch (e) { }
     });
 
+    /**
+     * 从项目级 profile 恢复上次的运行模式与自定义地址。
+     * 只在启动时调用一次；自定义模式但地址为空时回退为预览模式。
+     */
+    const restoreRunMode = (next: () => void) => {
+        let settled = false;
+        const finish = () => {
+            if (settled) return;
+            settled = true;
+            next();
+        };
+        try {
+            if (typeof Editor !== 'undefined' && Editor.Ipc) {
+                // 兜底：主进程未重载（没有 query-run-mode 处理器）时 1.2s 后用默认模式继续，
+                // 避免面板一直白屏等回调
+                setTimeout(() => {
+                    if (!settled) {
+                        logBridge('query-run-mode 无响应（插件主进程可能未重载），按默认模式继续');
+                        finish();
+                    }
+                }, 1200);
+                Editor.Ipc.sendToMain('mcp-inspector-bridge:query-run-mode', (err: any, res: any) => {
+                    if (!err && res) {
+                        const mode = res.mode;
+                        if (mode === 'preview' || mode === 'build' || mode === 'custom') {
+                            globalState.runMode = mode;
+                        }
+                        if (typeof res.url === 'string' && res.url) {
+                            globalState.customUrl = res.url;
+                        }
+                        if (globalState.runMode === 'custom' && !globalState.customUrl) {
+                            globalState.runMode = 'preview';
+                        }
+                        logBridge(`恢复上次运行模式: ${globalState.runMode} | 自定义地址: ${globalState.customUrl || '(空)'}`);
+                    }
+                    finish();
+                });
+                return;
+            }
+        } catch (e) { }
+        finish();
+    };
+
+    /** 持久化当前运行模式与自定义地址（项目级 profile，下次打开面板自动恢复） */
+    const saveRunMode = () => {
+        try {
+            if (typeof Editor !== 'undefined' && Editor.Ipc) {
+                Editor.Ipc.sendToMain('mcp-inspector-bridge:save-run-mode', {
+                    mode: globalState.runMode,
+                    url: globalState.customUrl || ''
+                });
+            }
+        } catch (e) { }
+    };
+
     const initializePreviewEnvironment = () => {
         if (isEnvInitialized) return;
         isEnvInitialized = true;
 
+        // 先恢复上次的运行模式，再走原有的端口探测 / 刷新流程
+        restoreRunMode(() => bootPreviewEnvironment());
+    };
+
+    const bootPreviewEnvironment = () => {
         try {
             const probeAlivePort = async (startPort: number): Promise<number> => {
                 for (let p = startPort; p <= startPort + 10; p++) {
@@ -849,6 +910,11 @@ export function useGameView(
 
             gameViewDynamic.addEventListener('did-finish-load', () => {
                 logBridge('webview 完成加载 (did-finish-load)');
+                // 自定义页面成功加载后才落盘：下次启动直接复用该地址
+                if (globalState.runMode === 'custom' && globalState.customUrl) {
+                    saveRunMode();
+                    logBridge(`已记住自定义地址: ${globalState.customUrl}`);
+                }
             });
 
             gameViewDynamic.addEventListener('did-fail-load', (e: any) => {

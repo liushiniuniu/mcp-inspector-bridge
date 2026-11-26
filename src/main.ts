@@ -159,6 +159,27 @@ module.exports = {
             profile.set('panel-width', value);
             profile.save();
         },
+        // --- 运行模式 / 自定义预览地址持久化（项目级） ---
+        'query-run-mode'(event: any) {
+            try {
+                const profile = Editor.Profile.load('profile://project/mcp-inspector-bridge.json', 'mcp-inspector-bridge');
+                const mode = profile.get('run-mode') || 'preview';
+                const url = profile.get('custom-url') || '';
+                if (event.reply) event.reply(null, { mode, url });
+            } catch (e: any) {
+                if (event.reply) event.reply(null, { mode: 'preview', url: '' });
+            }
+        },
+        'save-run-mode'(event: any, payload: { mode?: string; url?: string }) {
+            try {
+                const profile = Editor.Profile.load('profile://project/mcp-inspector-bridge.json', 'mcp-inspector-bridge');
+                if (payload && payload.mode) profile.set('run-mode', payload.mode);
+                if (payload && typeof payload.url === 'string') profile.set('custom-url', payload.url);
+                profile.save();
+            } catch (e: any) {
+                Editor.warn('[Bridge] 保存运行模式失败: ' + e.message);
+            }
+        },
         'query-custom-resolutions'(event: any) {
             const profile = Editor.Profile.load('profile://global/mcp-inspector-bridge.json', 'mcp-inspector-bridge');
             const res = profile.get('custom-resolutions') || [];
