@@ -1,5 +1,14 @@
 # 更新日志 (Update Log)
 
+## [Unreleased] - 2026-11-16
+
+### 🐛 缺陷修复
+
+- **修复 MCP 客户端启动即崩溃 (Fix MCP Client Crash on Startup)**
+  **问题**：`src/mcp-client/index.ts` 中 `Server` 的 `capabilities` 里 `prompts` 被注释掉，但随后仍调用 `setupPrompts(server)` 注册 `prompts/list` 处理器。`@modelcontextprotocol/sdk` 在注册时会校验能力，直接抛出 `Error: Server does not support prompts (required for prompts/list)`，进程退出，导致任何 MCP 客户端都无法连接。
+  **方案**：恢复 `capabilities.prompts: {}` 声明并重新构建 `dist/mcp-client/index.js`。已验证 `initialize`、`tools/list`（22 个工具）、`get_active_instances`（识别 4456 端口实例）与 `ping`（pong）全部正常。
+
+
 ## [Unreleased] - 2026-11-02
 
 ### 🔧 调试日志收敛
