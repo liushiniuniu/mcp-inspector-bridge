@@ -380,6 +380,17 @@ wss.on('connection', (ws, req) => {
   ws.on('error', (err) => log('客户端错误:', err && err.message));
 });
 
+server.on('error', (err) => {
+  if (err && err.code === 'EADDRINUSE') {
+    log('端口 ' + PORT + ' 已被占用（大概已经有一个代理在跑），本进程空转，可以直接按 F5');
+    log('代理已启动（复用已存在的实例）');
+    setInterval(() => {}, 1 << 30); // 保活，避免 VS Code 的 preLaunchTask 以为任务已结束
+    return;
+  }
+  log('监听失败:', err && err.message);
+  process.exit(1);
+});
+
 server.listen(PORT, '127.0.0.1', () => {
   log('代理已启动: 127.0.0.1:' + PORT + ' ← 编辑器 CDP 127.0.0.1:' + SRC_PORT + (FILTER ? '（过滤: ' + FILTER + '）' : ''));
   refreshTargets()
