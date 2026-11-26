@@ -5,6 +5,7 @@
 	"author": "Firekula",
 	"main": "dist/main.js",
 	"scripts": {
+		"bridge": "node scripts/cdp-webview-bridge.js",
 		"build": "tsc && esbuild src/probe/index.ts --bundle --outfile=dist/probe.js && esbuild src/mcp-client/index.ts --bundle --platform=node --outfile=dist/mcp-client/index.js",
 		"watch": "tsc -w & esbuild src/probe/index.ts --bundle --outfile=dist/probe.js --watch & esbuild src/mcp-client/index.ts --bundle --platform=node --outfile=dist/mcp-client/index.js --watch"
 	},
