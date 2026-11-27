@@ -7,7 +7,9 @@
 	"scripts": {
 		"bridge": "node scripts/cdp-webview-bridge.js",
 		"build": "tsc && esbuild src/probe/index.ts --bundle --outfile=dist/probe.js && esbuild src/mcp-client/index.ts --bundle --platform=node --outfile=dist/mcp-client/index.js",
-		"watch": "tsc -w & esbuild src/probe/index.ts --bundle --outfile=dist/probe.js --watch & esbuild src/mcp-client/index.ts --bundle --platform=node --outfile=dist/mcp-client/index.js --watch"
+		"watch": "tsc -w & esbuild src/probe/index.ts --bundle --outfile=dist/probe.js --watch & esbuild src/mcp-client/index.ts --bundle --platform=node --outfile=dist/mcp-client/index.js --watch",
+		"check:account": "node scripts/check-account-login.js",
+		"check:locate": "node scripts/check-locate-open.js"
 	},
 	"main-menu": {
 		"MCP 桥接器/开启运行时面板": {

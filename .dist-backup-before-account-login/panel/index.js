@@ -1,0 +1,1608 @@
+"use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", { value: true });
+const fs = __importStar(require("fs"));
+const path = __importStar(require("path"));
+const { createApp, ref, reactive, onMounted, watch, computed } = require('vue');
+const { NodeTree } = require('./components/NodeTree');
+const { NodeInspector } = require('./components/NodeInspector');
+const { RenderDebugger } = require('./components/RenderDebugger');
+const { ScriptManager } = require('./components/ScriptManager');
+const { FrameTimeline } = require('./components/FrameTimeline');
+const { MemoryTimeline } = require('./components/MemoryTimeline');
+const { ShaderTextureDetail } = require('./components/ShaderTextureDetail');
+const { useScriptSystem } = require('./composables/useScriptSystem');
+// 模块级引用，供 messages handlers 访问
+let _scriptSystem = null;
+let _refreshGameFn = null;
+let _gameViewSystem = null;
+const templateRaw = fs.readFileSync(path.join(__dirname, '../../src/panel/index.html'), 'utf-8');
+const preloadUrlResolved = 'file:///' + Editor.url('packages://mcp-inspector-bridge/dist/preload.js').replace(/\\/g, '/');
+const templateStr = templateRaw.replace('PRELOAD_PLACEHOLDER', preloadUrlResolved);
+const http = require('http');
+const { globalState } = require('./store');
+const { useLayout } = require('./composables/useLayout');
+const { useTabs } = require('./composables/useTabs');
+const { useGameView } = require('./composables/useGameView');
+const { useDevTools } = require('./composables/useDevTools');
+const { useProfiler } = require('./composables/useProfiler');
+const { useNodeSystem } = require('./composables/useNodeSystem');
+module.exports = Editor.Panel.extend({
+    style: `
+        :host { display: flex; flex-direction: column; width: 100%; height: 100%; margin: 0; padding: 0; overflow: hidden; }
+    `,
+    template: templateStr,
+    $: {
+        app: '#app',
+        gameView: '#game-view'
+    },
+    ready() {
+        const panelAppElement = this.$app;
+        if (!panelAppElement)
+            return;
+        try {
+            const app = createApp({
+                components: { NodeTree, 'node-inspector': NodeInspector, 'render-debugger': RenderDebugger, 'script-manager': ScriptManager, 'frame-timeline': FrameTimeline, 'memory-timeline': MemoryTimeline, 'shader-texture-detail': ShaderTextureDetail },
+                setup() {
+                    const activeTab = ref(0);
+                    const activeSettingSubTab = ref('appearance');
+                    const wrapperSize = ref({ width: 0, height: 0 });
+                    // 代理相关状态 (Proxy Config State)
+                    const showProxyModal = ref(false);
+                    const proxyForm = reactive({
+                        mode: 'system', // 'system' | 'direct' | 'custom'
+                        server: '',
+                        bypassLocalhost: true
+                    });
+                    // Vue Refs
+                    const gameView = ref(null);
+                    const devtoolsView = ref(null);
+                    const wrapMount = ref(null);
+                    const nodeTreeRef = ref(null);
+                    const inspectorWrapRef = ref(null);
+                    // Initialize Composables
+                    const layoutSystem = useLayout(globalState, wrapMount, wrapperSize, inspectorWrapRef);
+                    const tabSystem = useTabs();
+                    const profilerSystem = useProfiler(globalState, gameView, activeTab);
+                    const statsFpsColor = computed(() => {
+                        const fps = globalState.profiler.tick.fps;
+                        if (fps >= 55)
+                            return '#4caf50';
+                        if (fps >= 30)
+                            return '#ff9800';
+                        return '#f44336';
+                    });
+                    const statsAvgFpsColor = computed(() => {
+                        const fps = globalState.profiler.tick.avgFps;
+                        if (fps >= 55)
+                            return '#4caf50';
+                        if (fps >= 30)
+                            return '#ff9800';
+                        return '#f44336';
+                    });
+                    const stats1pLowColor = computed(() => {
+                        const fps = globalState.profiler.tick.fps1pLow;
+                        if (fps >= 30)
+                            return '#4caf50';
+                        if (fps >= 15)
+                            return '#ff9800';
+                        return '#f44336';
+                    });
+                    const stats01pLowColor = computed(() => {
+                        const fps = globalState.profiler.tick.fps01pLow;
+                        if (fps >= 20)
+                            return '#4caf50';
+                        if (fps >= 10)
+                            return '#ff9800';
+                        return '#f44336';
+                    });
+                    // 绘制调用颜色：< 50 绿色，< 150 橙色，>= 150 红色
+                    const statsDrawCallColor = computed(() => {
+                        const dc = globalState.profiler.tick.drawCall;
+                        if (dc < 50)
+                            return '#4caf50';
+                        if (dc < 150)
+                            return '#ff9800';
+                        return '#f44336';
+                    });
+                    // 逻辑耗时颜色：< 5ms 绿色，< 15ms 橙色，>= 15ms 红色
+                    const statsLogicTimeColor = computed(() => {
+                        const t = globalState.profiler.tick.logicTime;
+                        if (t < 5)
+                            return '#4caf50';
+                        if (t < 15)
+                            return '#ff9800';
+                        return '#f44336';
+                    });
+                    // 渲染耗时颜色：< 5ms 绿色，< 15ms 橙色，>= 15ms 红色
+                    const statsRenderTimeColor = computed(() => {
+                        const t = globalState.profiler.tick.renderTime;
+                        if (t < 5)
+                            return '#4caf50';
+                        if (t < 15)
+                            return '#ff9800';
+                        return '#f44336';
+                    });
+                    // 物理耗时颜色：< 2ms 绿色，< 8ms 橙色，>= 8ms 红色
+                    const statsPhysicsTimeColor = computed(() => {
+                        const t = globalState.profiler.tick.physicsTime;
+                        if (t === 0)
+                            return '#666'; // 未启用
+                        if (t < 2)
+                            return '#4caf50';
+                        if (t < 8)
+                            return '#ff9800';
+                        return '#f44336';
+                    });
+                    // 是否启用了物理系统
+                    const isPhysicsEnabled = computed(() => {
+                        return globalState.profiler.tick.physicsTime > 0;
+                    });
+                    // 着色器切换颜色：< 30 绿色，< 80 橙色，>= 80 红色
+                    const statsShaderSwColor = computed(() => {
+                        const s = globalState.profiler.tick.shaderSwitches;
+                        if (s < 30)
+                            return '#4caf50';
+                        if (s < 80)
+                            return '#ff9800';
+                        return '#f44336';
+                    });
+                    // 纹理绑定颜色：< 50 绿色，< 120 橙色，>= 120 红色
+                    const statsTexBindsColor = computed(() => {
+                        const t = globalState.profiler.tick.textureBinds;
+                        if (t < 50)
+                            return '#4caf50';
+                        if (t < 120)
+                            return '#ff9800';
+                        return '#f44336';
+                    });
+                    // 顶点数颜色：< 50000 绿色，< 150000 橙色，>= 150000 红色
+                    const statsVertsColor = computed(() => {
+                        const v = globalState.profiler.tick.vertices;
+                        if (v < 50000)
+                            return '#4caf50';
+                        if (v < 150000)
+                            return '#ff9800';
+                        return '#f44336';
+                    });
+                    // 三角面颜色：< 30000 绿色，< 100000 橙色，>= 100000 红色
+                    const statsTrisColor = computed(() => {
+                        const t = globalState.profiler.tick.triangles;
+                        if (t < 30000)
+                            return '#4caf50';
+                        if (t < 100000)
+                            return '#ff9800';
+                        return '#f44336';
+                    });
+                    // JS Heap 使用率颜色
+                    const statsJsHeapColor = computed(() => {
+                        const used = globalState.profiler.tick.jsHeapUsed;
+                        const total = globalState.profiler.tick.jsHeapTotal;
+                        if (total === 0)
+                            return '#e0e0e0';
+                        const ratio = used / total;
+                        if (ratio < 0.5)
+                            return '#4caf50';
+                        if (ratio < 0.75)
+                            return '#ff9800';
+                        return '#f44336';
+                    });
+                    const nodeSystem = useNodeSystem(globalState, gameView, nodeTreeRef, activeTab);
+                    const gameViewSystem = useGameView(globalState, gameView, nodeTreeRef, layoutSystem.rightPanelWidth, layoutSystem.selectedResolution, (payload, auto) => nodeSystem.onNodeSelect(payload, auto), () => profilerSystem.startTickPolling(), () => profilerSystem.stopTickPolling(), (uuid) => nodeSystem.locateAndExpandNode(uuid));
+                    const devToolsSystem = useDevTools(globalState, gameView, devtoolsView, activeTab, layoutSystem.rightPanelWidth);
+                    // --- 用户脚本系统 ---
+                    const registeredScriptTools = new Map();
+                    const registerMcpToolFn = (toolDef) => {
+                        registeredScriptTools.set(toolDef.name, toolDef);
+                        if (typeof Editor !== 'undefined') {
+                            Editor.Ipc.sendToMain('mcp-inspector-bridge:script-register-tool', toolDef);
+                        }
+                    };
+                    const unregisterMcpToolFn = (name) => {
+                        registeredScriptTools.delete(name);
+                        if (typeof Editor !== 'undefined') {
+                            Editor.Ipc.sendToMain('mcp-inspector-bridge:script-unregister-tool', name);
+                        }
+                    };
+                    const scriptSystem = useScriptSystem(globalState, gameView, registerMcpToolFn, unregisterMcpToolFn);
+                    _scriptSystem = scriptSystem;
+                    _refreshGameFn = gameViewSystem.refreshGame;
+                    _gameViewSystem = gameViewSystem;
+                    const openScriptEditor = (fileName, content) => {
+                        globalState.scriptEditorFileName = fileName || '';
+                        globalState.scriptEditorContent = content || `// ==McpScript==
+// @name        新脚本
+// @version     1.0.0
+// @description 脚本描述
+// @author      作者
+// @grant       input_simulation
+// ==/McpScript==
+
+mcp.log('脚本已加载');
+`;
+                        globalState.scriptEditorVisible = true;
+                    };
+                    const saveScriptEditor = () => {
+                        if (!globalState.scriptEditorFileName) {
+                            if (typeof Editor !== 'undefined')
+                                Editor.log('[Script] 请先输入文件名');
+                            return;
+                        }
+                        let fn = globalState.scriptEditorFileName;
+                        if (!fn.endsWith('.user.js')) {
+                            if (fn.endsWith('.js')) {
+                                fn = fn.slice(0, -3) + '.user.js';
+                            }
+                            else {
+                                fn = fn + '.user.js';
+                            }
+                        }
+                        const nameMatch = globalState.scriptEditorContent.match(/\/\/\s*@name\s+(.+)/);
+                        if (!nameMatch || !nameMatch[1].trim()) {
+                            if (typeof Editor !== 'undefined')
+                                Editor.warn('[Script] @name 为必填字段，请在脚本中填写后保存');
+                            return;
+                        }
+                        if (typeof Editor !== 'undefined') {
+                            Editor.Ipc.sendToMain('mcp-inspector-bridge:script-save-file', { fileName: fn, content: globalState.scriptEditorContent }, (err) => {
+                                if (!err)
+                                    scriptSystem.loadScript(fn, globalState.scriptEditorContent);
+                                globalState.scriptEditorVisible = false;
+                            });
+                        }
+                        else {
+                            globalState.scriptEditorVisible = false;
+                        }
+                    };
+                    const handleScriptImport = () => {
+                        if (typeof Editor !== 'undefined') {
+                            Editor.Ipc.sendToMain('mcp-inspector-bridge:script-import-dialog', {}, (err, result) => {
+                                if (result && result.content && !result.canceled) {
+                                    scriptSystem.loadScript(result.fileName, result.content);
+                                }
+                            });
+                        }
+                    };
+                    const handleScriptExport = (fileName) => {
+                        if (typeof Editor !== 'undefined') {
+                            Editor.Ipc.sendToMain('mcp-inspector-bridge:script-export-file', { fileName });
+                        }
+                    };
+                    const handleScriptDelete = (fileName) => {
+                        scriptSystem.removeScript(fileName);
+                        if (typeof Editor !== 'undefined') {
+                            Editor.Ipc.sendToMain('mcp-inspector-bridge:script-delete-file', { fileName });
+                        }
+                    };
+                    const handleScriptEnable = (fileName) => {
+                        if (typeof Editor !== 'undefined') {
+                            Editor.Ipc.sendToMain('mcp-inspector-bridge:script-read-file', { fileName }, (err, data) => {
+                                if (data && data.content) {
+                                    scriptSystem.enableScript(fileName, data.content);
+                                    Editor.Ipc.sendToMain('mcp-inspector-bridge:script-set-enabled', { fileName, enabled: true });
+                                }
+                            });
+                        }
+                    };
+                    const handleScriptEdit = (fileName) => {
+                        if (typeof Editor !== 'undefined') {
+                            Editor.Ipc.sendToMain('mcp-inspector-bridge:script-read-file', { fileName }, (err, data) => {
+                                if (data && data.content) {
+                                    openScriptEditor(fileName, data.content);
+                                }
+                                else if (data && data.error) {
+                                    if (typeof Editor !== 'undefined') {
+                                        Editor.warn(`[Script] 读取脚本文件失败: ${data.error}`);
+                                    }
+                                }
+                            });
+                        }
+                    };
+                    const JS_KEYWORDS = new Set([
+                        'function', 'const', 'let', 'var', 'if', 'else', 'return', 'try', 'catch',
+                        'throw', 'new', 'for', 'while', 'switch', 'case', 'break', 'continue',
+                        'class', 'extends', 'import', 'export', 'default', 'this', 'super',
+                        'async', 'await', 'typeof', 'instanceof', 'void', 'delete', 'in', 'of',
+                        'yield', 'true', 'false', 'null', 'undefined', 'debugger', 'do', 'static',
+                        'get', 'set', 'from', 'as', 'finally', 'with', 'enum', 'implements',
+                        'interface', 'package', 'private', 'protected', 'public', 'type',
+                    ]);
+                    const escapeHtml = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                    const highlightJs = (code) => {
+                        let out = '';
+                        let i = 0;
+                        const len = code.length;
+                        while (i < len) {
+                            const ch = code[i];
+                            const rest = code.slice(i);
+                            // McpScript 标记行 (// ==McpScript== 或 // ==/McpScript==)
+                            if (ch === '/' && code[i + 1] === '/' && /\s*==\/?McpScript==/.test(code.slice(i + 2, i + 20))) {
+                                const eol = code.indexOf('\n', i);
+                                const end = eol === -1 ? len : eol;
+                                out += `<span style="color:#d7ba7d">${escapeHtml(code.slice(i, end))}</span>`;
+                                i = end;
+                                continue;
+                            }
+                            // @annotation 行 (// @name, // @grant, etc.)
+                            if (ch === '/' && code[i + 1] === '/' && /\s*@\w+/.test(code.slice(i + 2, i + 30))) {
+                                const eol = code.indexOf('\n', i);
+                                const end = eol === -1 ? len : eol;
+                                out += `<span style="color:#c586c0">${escapeHtml(code.slice(i, end))}</span>`;
+                                i = end;
+                                continue;
+                            }
+                            // 单行注释 //
+                            if (ch === '/' && code[i + 1] === '/') {
+                                const eol = code.indexOf('\n', i);
+                                const end = eol === -1 ? len : eol;
+                                out += `<span style="color:#6a9955">${escapeHtml(code.slice(i, end))}</span>`;
+                                i = end;
+                                continue;
+                            }
+                            // 多行注释 /* */
+                            if (ch === '/' && code[i + 1] === '*') {
+                                const closeIdx = code.indexOf('*/', i + 2);
+                                const end = closeIdx === -1 ? len : closeIdx + 2;
+                                out += `<span style="color:#6a9955">${escapeHtml(code.slice(i, end))}</span>`;
+                                i = end;
+                                continue;
+                            }
+                            // 模板字面量 `` (支持 ${} 内嵌)
+                            if (ch === '`') {
+                                let j = i + 1;
+                                while (j < len) {
+                                    if (code[j] === '\\') {
+                                        j += 2;
+                                        continue;
+                                    }
+                                    if (code[j] === '`') {
+                                        j++;
+                                        break;
+                                    }
+                                    if (code[j] === '$' && code[j + 1] === '{') {
+                                        // 找到 } 闭合
+                                        let depth = 1;
+                                        j += 2;
+                                        while (j < len && depth > 0) {
+                                            if (code[j] === '{')
+                                                depth++;
+                                            else if (code[j] === '}')
+                                                depth--;
+                                            j++;
+                                        }
+                                        continue;
+                                    }
+                                    j++;
+                                }
+                                out += `<span style="color:#ce9178">${escapeHtml(code.slice(i, j))}</span>`;
+                                i = j;
+                                continue;
+                            }
+                            // 字符串 '' 或 ""
+                            if (ch === "'" || ch === '"') {
+                                let j = i + 1;
+                                while (j < len) {
+                                    if (code[j] === '\\') {
+                                        j += 2;
+                                        continue;
+                                    }
+                                    if (code[j] === ch) {
+                                        j++;
+                                        break;
+                                    }
+                                    j++;
+                                }
+                                out += `<span style="color:#ce9178">${escapeHtml(code.slice(i, j))}</span>`;
+                                i = j;
+                                continue;
+                            }
+                            // 数字
+                            if (/\d/.test(ch) && (i === 0 || /[\s,;=({[+\-*/%!&|^~<>?:]/.test(code[i - 1]))) {
+                                const m = rest.match(/^(\d+\.?\d*(?:[eE][+-]?\d+)?)/);
+                                if (m) {
+                                    out += `<span style="color:#b5cea8">${m[1]}</span>`;
+                                    i += m[1].length;
+                                    continue;
+                                }
+                            }
+                            // 标识符 / 关键词
+                            if (/[a-zA-Z_$]/.test(ch)) {
+                                const m = rest.match(/^([a-zA-Z_$][\w$]*)/);
+                                if (m) {
+                                    const word = m[1];
+                                    if (JS_KEYWORDS.has(word)) {
+                                        out += `<span style="color:#569cd6">${word}</span>`;
+                                    }
+                                    else {
+                                        out += escapeHtml(word);
+                                    }
+                                    i += word.length;
+                                    continue;
+                                }
+                            }
+                            // 默认
+                            out += escapeHtml(ch);
+                            i++;
+                        }
+                        return out;
+                    };
+                    const highlightedScriptContent = computed(() => highlightJs(globalState.scriptEditorContent));
+                    // --- 用户脚本系统结束 ---
+                    const electron = require('electron');
+                    const savedScale = window.localStorage.getItem('mcp-ui-scale');
+                    if (savedScale && !isNaN(parseFloat(savedScale))) {
+                        globalState.uiScale = parseFloat(savedScale);
+                    }
+                    const savedFontSize = window.localStorage.getItem('mcp-base-font-size');
+                    if (savedFontSize && !isNaN(parseInt(savedFontSize))) {
+                        globalState.baseFontSize = parseInt(savedFontSize, 10);
+                    }
+                    const savedLayout = window.localStorage.getItem('mcp-inspector-layout');
+                    if (savedLayout === 'vertical' || savedLayout === 'horizontal') {
+                        globalState.inspectorLayout = savedLayout;
+                    }
+                    const savedRecordFps = window.localStorage.getItem('mcp-record-fps');
+                    if (savedRecordFps && !isNaN(parseInt(savedRecordFps))) {
+                        globalState.recordFps = parseInt(savedRecordFps, 10);
+                    }
+                    else {
+                        globalState.recordFps = 30;
+                    }
+                    const savedRecordScale = window.localStorage.getItem('mcp-record-scale');
+                    if (savedRecordScale && !isNaN(parseFloat(savedRecordScale))) {
+                        globalState.recordScale = parseFloat(savedRecordScale);
+                    }
+                    else {
+                        globalState.recordScale = 1.0;
+                    }
+                    const savedRecordFormat = window.localStorage.getItem('mcp-record-format');
+                    if (savedRecordFormat) {
+                        globalState.recordFormat = savedRecordFormat;
+                    }
+                    else {
+                        globalState.recordFormat = 'webm';
+                    }
+                    watch(() => globalState.inspectorLayout, (newVal) => {
+                        try {
+                            window.localStorage.setItem('mcp-inspector-layout', newVal);
+                        }
+                        catch (e) { }
+                    });
+                    watch(() => globalState.recordFps, (newVal) => {
+                        try {
+                            window.localStorage.setItem('mcp-record-fps', newVal.toString());
+                        }
+                        catch (e) { }
+                    });
+                    watch(() => globalState.recordScale, (newVal) => {
+                        try {
+                            window.localStorage.setItem('mcp-record-scale', newVal.toString());
+                        }
+                        catch (e) { }
+                    });
+                    watch(() => globalState.recordFormat, (newVal) => {
+                        try {
+                            window.localStorage.setItem('mcp-record-format', newVal);
+                        }
+                        catch (e) { }
+                    });
+                    watch(() => globalState.baseFontSize, (newVal) => {
+                        try {
+                            if (panelAppElement)
+                                panelAppElement.style.setProperty('--base-font-size', `${newVal}px`);
+                            window.localStorage.setItem('mcp-base-font-size', newVal.toString());
+                        }
+                        catch (e) { }
+                    });
+                    watch(() => globalState.uiScale, (newVal) => {
+                        try {
+                            if (typeof Editor !== 'undefined') {
+                                Editor.log('[MCP Inspector] -> Executing scale:', newVal, '| target:', !!panelAppElement);
+                            }
+                            else {
+                                console.log('[MCP Inspector] -> Executing scale:', newVal, '| target:', !!panelAppElement);
+                            }
+                            // 直接通过插件生命周期的 this.$app 句柄施加原生缩放设置，突破 Shadow DOM 与 Vue 挂载盲区。
+                            if (panelAppElement) {
+                                panelAppElement.style.zoom = newVal.toString();
+                            }
+                            window.localStorage.setItem('mcp-ui-scale', newVal.toString());
+                            setTimeout(() => {
+                                if (devToolsSystem.updateBrowserViewBounds) {
+                                    devToolsSystem.updateBrowserViewBounds();
+                                }
+                            }, 20);
+                        }
+                        catch (e) { }
+                    });
+                    watch(activeTab, (newVal) => {
+                        try {
+                            const wv = gameView.value;
+                            if (wv && typeof wv.executeJavaScript === 'function') {
+                                wv.executeJavaScript(`
+                                window.__mcpActiveTab = ${newVal};
+                                if(${newVal} === 0 && window.__mcpProbeInitialized && typeof window.__mcpSyncNodeTree === 'function') {
+                                    window.__mcpSyncNodeTree();
+                                }
+                                if(${newVal} === 2 && window.__mcpProbeInitialized && typeof window.__mcpGetEnvInfo === 'function') {
+                                    if (window.__mcpInspector && window.__mcpInspector.updateEnv) window.__mcpInspector.updateEnv(JSON.stringify(window.__mcpGetEnvInfo()));
+                                }
+                            `).catch((e) => { });
+                            }
+                        }
+                        catch (e) { }
+                    });
+                    onMounted(() => {
+                        layoutSystem.setupResizeObserver();
+                        gameViewSystem.setupGameViewListeners();
+                        devToolsSystem.setupDevToolsWatchers();
+                        profilerSystem.setupProfilerWatchers();
+                        if (panelAppElement) {
+                            panelAppElement.style.zoom = globalState.uiScale.toString();
+                            panelAppElement.style.setProperty('--base-font-size', globalState.baseFontSize + 'px');
+                        }
+                        // 从 LocalStorage 恢复代理配置并发送至主进程
+                        try {
+                            const savedProxy = window.localStorage.getItem('mcp_webview_proxy_config');
+                            if (savedProxy) {
+                                const parsed = JSON.parse(savedProxy);
+                                if (parsed && typeof parsed === 'object') {
+                                    if (parsed.mode)
+                                        proxyForm.mode = parsed.mode;
+                                    if (parsed.server !== undefined)
+                                        proxyForm.server = parsed.server;
+                                    if (parsed.bypassLocalhost !== undefined)
+                                        proxyForm.bypassLocalhost = parsed.bypassLocalhost;
+                                    if (typeof Editor !== 'undefined') {
+                                        Editor.Ipc.sendToMain('mcp-inspector-bridge:set-webview-proxy', {
+                                            mode: proxyForm.mode,
+                                            server: proxyForm.server,
+                                            bypassLocalhost: proxyForm.bypassLocalhost
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        catch (e) {
+                            console.warn('[Proxy] 读取本地代理配置失败:', e);
+                        }
+                        window.addEventListener('mcp-status-changed', ((e) => {
+                            globalState.mcpStatus = e.detail;
+                        }));
+                        if (typeof Editor !== 'undefined') {
+                            Editor.Ipc.sendToMain('mcp-inspector-bridge:query-mcp-status', (err, status) => {
+                                if (status) {
+                                    globalState.mcpStatus = status;
+                                }
+                            });
+                            refreshMcpClients();
+                            fetchMcpPayload();
+                            // 恢复已安装的用户脚本
+                            Editor.Ipc.sendToMain('mcp-inspector-bridge:script-list-files', {}, (e3, files) => {
+                                if (files && Array.isArray(files)) {
+                                    let loaded = 0;
+                                    for (const f of files) {
+                                        Editor.Ipc.sendToMain('mcp-inspector-bridge:script-read-file', { fileName: f.name }, (e4, data) => {
+                                            if (data && data.content) {
+                                                scriptSystem.loadScript(f.name, data.content);
+                                                if (!f.enabled) {
+                                                    scriptSystem.disableScript(f.name);
+                                                }
+                                            }
+                                            loaded++;
+                                            if (loaded >= files.length) {
+                                                scriptSystem.syncToState();
+                                            }
+                                        });
+                                    }
+                                    if (files.length === 0)
+                                        scriptSystem.syncToState();
+                                }
+                            });
+                        }
+                    });
+                    const refreshMcpClients = () => {
+                        globalState.mcpScanning = true;
+                        if (typeof Editor !== 'undefined') {
+                            Editor.Ipc.sendToMain('mcp-inspector-bridge:mcp-scan-clients', (err, list) => {
+                                globalState.mcpScanning = false;
+                                if (!err && list) {
+                                    globalState.mcpClientList = list;
+                                }
+                            });
+                        }
+                    };
+                    const fetchMcpPayload = () => {
+                        if (typeof Editor !== 'undefined') {
+                            Editor.Ipc.sendToMain('mcp-inspector-bridge:mcp-get-payload', (err, pl) => {
+                                if (!err && pl) {
+                                    globalState.mcpPayload = pl;
+                                }
+                            });
+                        }
+                    };
+                    let _mcpToastTimer = null;
+                    const showMcpToast = (msg) => {
+                        globalState.mcpInjectLog = msg;
+                        if (_mcpToastTimer !== null)
+                            clearTimeout(_mcpToastTimer);
+                        _mcpToastTimer = setTimeout(() => {
+                            globalState.mcpInjectLog = "";
+                            _mcpToastTimer = null;
+                        }, 1000);
+                    };
+                    const configureMcpClient = (clientId = -1) => {
+                        globalState.mcpScanning = true;
+                        if (typeof Editor !== 'undefined') {
+                            Editor.Ipc.sendToMain('mcp-inspector-bridge:mcp-inject-client', clientId, (err, log) => {
+                                if (err) {
+                                    showMcpToast("写入由于主进程故障失败: " + err.message);
+                                }
+                                else {
+                                    showMcpToast(log);
+                                }
+                                // Inject完成之后由于可能更新了其它依赖状态，执行一次重新拉取
+                                refreshMcpClients();
+                            });
+                        }
+                        else {
+                            showMcpToast("请在 Cocos Editor 环境中使用。");
+                            globalState.mcpScanning = false;
+                        }
+                    };
+                    const copyMcpPayload = () => {
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            navigator.clipboard.writeText(globalState.mcpPayload).then(() => {
+                                showMcpToast("已复制配置文本至剪贴板。");
+                            }).catch(e => {
+                                showMcpToast("复制失败: " + e);
+                            });
+                        }
+                        else {
+                            const textArea = document.createElement("textarea");
+                            textArea.value = globalState.mcpPayload;
+                            document.body.appendChild(textArea);
+                            textArea.select();
+                            try {
+                                document.execCommand('copy');
+                                showMcpToast("已复制配置文本至剪贴板(Fallback)。");
+                            }
+                            catch (err) {
+                                showMcpToast("复制失败(Fallback): " + err);
+                            }
+                            document.body.removeChild(textArea);
+                        }
+                    };
+                    const copyMcpPath = (path) => {
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            navigator.clipboard.writeText(path);
+                        }
+                        else {
+                            const textArea = document.createElement("textarea");
+                            textArea.value = path;
+                            document.body.appendChild(textArea);
+                            textArea.select();
+                            try {
+                                document.execCommand('copy');
+                            }
+                            catch (err) { }
+                            document.body.removeChild(textArea);
+                        }
+                        showMcpToast("已复制路径至剪贴板。");
+                    };
+                    const isAtlasModalOpen = ref(false);
+                    const isCapturingAtlas = ref(false);
+                    const atlasImages = ref([]);
+                    const selectedAtlasIndex = ref(0);
+                    const atlasZoom = ref(1);
+                    const atlasTranslateX = ref(0);
+                    const atlasTranslateY = ref(0);
+                    const isDraggingAtlas = ref(false);
+                    let lastMouseX = 0;
+                    let lastMouseY = 0;
+                    const toggleAtlasModal = () => {
+                        isAtlasModalOpen.value = !isAtlasModalOpen.value;
+                    };
+                    const captureAtlases = () => {
+                        if (isCapturingAtlas.value) {
+                            return;
+                        }
+                        isCapturingAtlas.value = true;
+                        showMcpToast("开始提取图集缓冲...");
+                        const wv = gameView.value;
+                        if (wv && typeof wv.executeJavaScript === 'function') {
+                            // WebGL texture extraction code that runs inside webview context
+                            const extractCode = `
+                            function __mcpExtractAtlases() {
+                                try {
+                                    if(!window.cc || !cc.dynamicAtlasManager) return JSON.stringify({error: "引擎对象不存在"});
+                                    
+                                    // Hack: We cannot access the closure variables directly.
+                                    // But the engine's showDebug(true) will create a node DYNAMIC_ATLAS_DEBUG_NODE
+                                    // in the scene root, which iterates the closures and creates sprites for each.
+                                    cc.dynamicAtlasManager.showDebug(true);
+                                    
+                                    var scene = cc.director.getScene();
+                                    var dbgNode = scene && scene.getChildByName("DYNAMIC_ATLAS_DEBUG_NODE");
+                                    if (!dbgNode) {
+                                        if (cc.dynamicAtlasManager.showDebug) cc.dynamicAtlasManager.showDebug(false);
+                                        return JSON.stringify({error: "目前还没有动态图集产生"});
+                                    }
+                                    
+                                    // find CONTENT node
+                                    var content = dbgNode.getChildByName("CONTENT");
+                                    if (!content && dbgNode.children.length > 0) content = dbgNode.children[0];
+
+                                    if (!content || !content.children || content.children.length === 0) {
+                                        cc.dynamicAtlasManager.showDebug(false);
+                                        return JSON.stringify({error: "目前还没有动态图集产生"});
+                                    }
+                                    
+                                    function readTexture(texture) {
+                                        var gl = cc.game._renderContext;
+                                        var textureImpl = texture._texture || texture.getHtmlElementObj && texture.getHtmlElementObj();
+                                        if (!textureImpl) return null;
+                                        
+                                        var glID = textureImpl._glID || texture._glID;
+                                        if (!glID) return null;
+
+                                        var fbo = gl.createFramebuffer();
+                                        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+                                        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, glID, 0);
+                                        
+                                        var status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+                                        if (status !== gl.FRAMEBUFFER_COMPLETE) {
+                                            gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                                            gl.deleteFramebuffer(fbo);
+                                            return null;
+                                        }
+
+                                        var w = texture.width;
+                                        var h = texture.height;
+                                        var pixels = new Uint8Array(w * h * 4);
+                                        gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+                                        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                                        gl.deleteFramebuffer(fbo);
+                                        
+                                        var canvas = document.createElement('canvas');
+                                        canvas.width = w;
+                                        canvas.height = h;
+                                        var ctx = canvas.getContext('2d');
+                                        if (!ctx) return null;
+                                        var imgData = ctx.createImageData(w, h);
+                                        imgData.data.set(pixels);
+                                        ctx.putImageData(imgData, 0, 0);
+                                        return canvas.toDataURL('image/jpeg', 0.85); // Compress for IPC
+                                    }
+
+                                    var results = [];
+                                    for(var i = 0; i < content.children.length; i++) {
+                                        var atlasNode = content.children[i];
+                                        if (atlasNode && atlasNode.name === "ATLAS") {
+                                            var sprite = atlasNode.getComponent(cc.Sprite);
+                                            if (sprite && sprite.spriteFrame) {
+                                                var tex = sprite.spriteFrame.getTexture();
+                                                if (tex) {
+                                                    var dataUrl = readTexture(tex);
+                                                    if (dataUrl) results.push(dataUrl);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    
+                                    // 提取完毕，立即销毁调试节点以保持侵入零污染
+                                    cc.dynamicAtlasManager.showDebug(false);
+                                    
+                                    if(results.length === 0) return JSON.stringify({error: "已拦截引擎DOM但底层的 WebGL 解析不可用"});
+                                    return JSON.stringify(results);
+                                } catch(e) {
+                                    return JSON.stringify({error: "引擎内执行报错: " + e.stack});
+                                }
+                            }
+                            __mcpExtractAtlases();
+                        `;
+                            let timeoutId = setTimeout(() => {
+                                isCapturingAtlas.value = false;
+                                if (typeof Editor !== 'undefined')
+                                    Editor.log("[Bridge] 提取耗时过长，内存通讯阻塞");
+                                showMcpToast("提取由于超时被中止");
+                            }, 4000);
+                            try {
+                                const capturePromise = wv.executeJavaScript(extractCode);
+                                Promise.race([capturePromise, new Promise((_, r) => setTimeout(() => r('TIMEOUT'), 3900))])
+                                    .then((resStr) => {
+                                    clearTimeout(timeoutId);
+                                    if (resStr === 'TIMEOUT')
+                                        return; // Handled by timeoutId above
+                                    isCapturingAtlas.value = false;
+                                    try {
+                                        const res = (typeof resStr === 'string') ? JSON.parse(resStr) : resStr;
+                                        if (res && res.error) {
+                                            if (typeof Editor !== 'undefined')
+                                                Editor.log("[Bridge] 提取图集失败: " + res.error);
+                                            showMcpToast("提取图集失败: " + res.error);
+                                            return;
+                                        }
+                                        if (Array.isArray(res)) {
+                                            if (typeof Editor !== 'undefined')
+                                                Editor.log("[Bridge] 成功提取图集数量: " + res.length);
+                                            atlasImages.value = res.filter(Boolean);
+                                            selectedAtlasIndex.value = 0;
+                                            isAtlasModalOpen.value = true;
+                                        }
+                                        else {
+                                            if (typeof Editor !== 'undefined')
+                                                Editor.log("[Bridge] 未能识别的图集数据格式: " + typeof res);
+                                        }
+                                    }
+                                    catch (e) {
+                                        if (typeof Editor !== 'undefined')
+                                            Editor.log("[Bridge] 解析失败: " + e.message);
+                                    }
+                                }).catch((err) => {
+                                    clearTimeout(timeoutId);
+                                    isCapturingAtlas.value = false;
+                                    if (typeof Editor !== 'undefined')
+                                        Editor.log("[Bridge] Webview 注入发生底层错误: " + err);
+                                });
+                            }
+                            catch (syncErr) {
+                                clearTimeout(timeoutId);
+                                isCapturingAtlas.value = false;
+                                if (typeof Editor !== 'undefined')
+                                    Editor.log("[Bridge] executeJavaScript 同步调用崩溃: " + syncErr);
+                            }
+                        }
+                        else {
+                            isCapturingAtlas.value = false;
+                        }
+                    };
+                    const copyMcpLogs = () => {
+                        const text = globalState.mcpLogs.map((l) => `[${l.time}] [${l.type.toUpperCase()}] ${l.content}`).join('\\n');
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            navigator.clipboard.writeText(text).then(() => {
+                                showMcpToast("已复制全部日志");
+                            }).catch((e) => showMcpToast("复制日志失败: " + e));
+                        }
+                        else {
+                            const textArea = document.createElement("textarea");
+                            textArea.value = text;
+                            document.body.appendChild(textArea);
+                            textArea.select();
+                            try {
+                                document.execCommand('copy');
+                                showMcpToast("已复制全部日志");
+                            }
+                            catch (err) { }
+                            document.body.removeChild(textArea);
+                        }
+                    };
+                    /**
+                     * 保存代理配置至 LocalStorage 并发送 IPC 通道告知主进程更新设置，随后触发 Webview 重新加载
+                     */
+                    const saveProxySettings = () => {
+                        const payload = {
+                            mode: proxyForm.mode,
+                            server: proxyForm.server,
+                            bypassLocalhost: proxyForm.bypassLocalhost
+                        };
+                        try {
+                            window.localStorage.setItem('mcp_webview_proxy_config', JSON.stringify(payload));
+                        }
+                        catch (e) {
+                            console.warn('[Proxy] 保存代理配置至 localStorage 失败:', e);
+                        }
+                        if (typeof Editor !== 'undefined') {
+                            Editor.Ipc.sendToMain('mcp-inspector-bridge:set-webview-proxy', payload);
+                        }
+                        showProxyModal.value = false;
+                        if (gameViewSystem && typeof gameViewSystem.refreshGame === 'function') {
+                            gameViewSystem.refreshGame();
+                        }
+                        else if (_refreshGameFn) {
+                            _refreshGameFn();
+                        }
+                    };
+                    return {
+                        showProxyModal,
+                        proxyForm,
+                        saveProxySettings,
+                        activeTab,
+                        activeSettingSubTab,
+                        globalState,
+                        gameView,
+                        devtoolsView,
+                        wrapMount,
+                        inspectorWrapRef,
+                        nodeTreeRef,
+                        statsFpsColor,
+                        statsAvgFpsColor,
+                        stats1pLowColor,
+                        stats01pLowColor,
+                        statsDrawCallColor,
+                        statsLogicTimeColor,
+                        statsRenderTimeColor,
+                        statsPhysicsTimeColor,
+                        isPhysicsEnabled,
+                        statsShaderSwColor,
+                        statsTexBindsColor,
+                        statsVertsColor,
+                        statsTrisColor,
+                        statsJsHeapColor,
+                        isAtlasModalOpen,
+                        atlasImages,
+                        selectedAtlasIndex,
+                        isCapturingAtlas,
+                        atlasZoom,
+                        atlasTranslateX,
+                        atlasTranslateY,
+                        isDraggingAtlas,
+                        toggleAtlasModal,
+                        captureAtlases,
+                        handleAtlasWheel: (e) => {
+                            const zoomSpeed = 0.1;
+                            const delta = e.deltaY > 0 ? -zoomSpeed : zoomSpeed;
+                            atlasZoom.value = Math.max(0.1, Math.min(atlasZoom.value + delta * atlasZoom.value, 10));
+                        },
+                        startDragAtlas: (e) => {
+                            if (e.button === 0 || e.button === 1) { // 左键或中键拖拽
+                                isDraggingAtlas.value = true;
+                                lastMouseX = e.clientX;
+                                lastMouseY = e.clientY;
+                            }
+                        },
+                        onDragAtlas: (e) => {
+                            if (!isDraggingAtlas.value)
+                                return;
+                            atlasTranslateX.value += (e.clientX - lastMouseX);
+                            atlasTranslateY.value += (e.clientY - lastMouseY);
+                            lastMouseX = e.clientX;
+                            lastMouseY = e.clientY;
+                        },
+                        endDragAtlas: () => {
+                            isDraggingAtlas.value = false;
+                        },
+                        resetAtlasView: () => {
+                            atlasZoom.value = 1;
+                            atlasTranslateX.value = 0;
+                            atlasTranslateY.value = 0;
+                        },
+                        selectAtlas: (idx) => {
+                            selectedAtlasIndex.value = idx;
+                            atlasZoom.value = 1;
+                            atlasTranslateX.value = 0;
+                            atlasTranslateY.value = 0;
+                        },
+                        onAtlasImageLoad: (e) => {
+                            var _a;
+                            const img = e.target;
+                            const container = (_a = img.parentElement) === null || _a === void 0 ? void 0 : _a.parentElement;
+                            if (container && img.naturalWidth && img.naturalHeight) {
+                                const padding = 40; // 20px edge padding
+                                const scaleX = (container.clientWidth - padding) / img.naturalWidth;
+                                const scaleY = (container.clientHeight - padding) / img.naturalHeight;
+                                const fitScale = Math.min(scaleX, scaleY, 1);
+                                atlasZoom.value = fitScale;
+                            }
+                        },
+                        refreshMcpClients,
+                        configureMcpClient,
+                        copyMcpPayload,
+                        copyMcpPath,
+                        copyMcpLogs,
+                        scriptSystem,
+                        openScriptEditor,
+                        saveScriptEditor,
+                        handleScriptImport,
+                        handleScriptExport,
+                        handleScriptDelete,
+                        handleScriptEnable,
+                        handleScriptEdit,
+                        highlightedScriptContent,
+                        registeredScriptTools,
+                        ...layoutSystem,
+                        ...tabSystem,
+                        ...gameViewSystem,
+                        ...devToolsSystem,
+                        ...profilerSystem,
+                        ...nodeSystem
+                    };
+                }
+            });
+            this._vueApp = app;
+            app.mount(this.$app);
+        }
+        catch (e) {
+            console.error('[Bridge] Vue app mount error:', e);
+        }
+    },
+    messages: {
+        'mcp-query-selected-node'(event, reqId) {
+            const wv = this.shadowRoot ? this.shadowRoot.querySelector('#game-view') : null;
+            if (!wv) {
+                if (event.reply)
+                    event.reply(null, { reqId, error: "Game view not found" });
+                return;
+            }
+            if (typeof wv.isConnected === 'boolean' && !wv.isConnected) {
+                if (event.reply)
+                    event.reply(null, { reqId, error: "WebView detached from DOM" });
+                return;
+            }
+            try {
+                wv.getWebContentsId();
+            }
+            catch (e) {
+                if (event.reply)
+                    event.reply(null, { reqId, error: "WebView not ready" });
+                return;
+            }
+            const code = `
+                (function(){
+                    if(!window.__mcpHighlightData || !window.__mcpHighlightData.selectId) return null;
+                    if(!window.__mcpCrawler || typeof window.__mcpCrawler.getSimplifiedNode !== 'function') return null;
+                    return JSON.stringify(window.__mcpCrawler.getSimplifiedNode(window.__mcpHighlightData.selectId));
+                })();
+            `;
+            try {
+                const promise = wv.executeJavaScript(code);
+                if (promise && promise.then) {
+                    promise.then((res) => {
+                        if (event.reply)
+                            event.reply(null, { reqId, result: res ? JSON.parse(res) : null });
+                    }).catch((e) => {
+                        if (event.reply)
+                            event.reply(null, { reqId, error: "Execution failed: " + e.message });
+                    });
+                }
+            }
+            catch (e) { }
+        },
+        'mcp-query-node-detail'(event, args) {
+            const wv = this.shadowRoot ? this.shadowRoot.querySelector('#game-view') : null;
+            if (!wv) {
+                if (event.reply)
+                    event.reply(null, { error: 'No WebView' });
+                return;
+            }
+            if (typeof wv.isConnected === 'boolean' && !wv.isConnected) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView detached from DOM' });
+                return;
+            }
+            try {
+                wv.getWebContentsId();
+            }
+            catch (e) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView not ready' });
+                return;
+            }
+            const code = `
+                (function(){
+                    try {
+                        if(!window.__mcpCrawler) return JSON.stringify({ error: 'Crawler not injected' });
+                        var n = window.__mcpCrawler.findNodeByUuid('${args.uuid}');
+                        if(!n) return JSON.stringify({ error: 'NODE_NOT_FOUND', msg: 'Node destroyed or not found' });
+                        return JSON.stringify(window.__mcpCrawler.getNodeDetail('${args.uuid}'));
+                    } catch(e) { return JSON.stringify({ error: 'EXECUTION_FAILED', msg: e.message }); }
+                })();
+            `;
+            wv.executeJavaScript(code).then((r) => { if (event.reply)
+                event.reply(null, typeof r === 'string' ? JSON.parse(r) : r); }).catch((e) => { if (event.reply)
+                event.reply(null, { error: e.message }); });
+        },
+        'mcp-update-property'(event, args) {
+            var _a;
+            const wv = this.shadowRoot ? this.shadowRoot.querySelector('#game-view') : null;
+            if (!wv) {
+                if (event.reply)
+                    event.reply(null, { error: 'No WebView' });
+                return;
+            }
+            if (typeof wv.isConnected === 'boolean' && !wv.isConnected) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView detached from DOM' });
+                return;
+            }
+            try {
+                wv.getWebContentsId();
+            }
+            catch (e) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView not ready' });
+                return;
+            }
+            const code = `
+                (function(){
+                    try {
+                        if(!window.__mcpCrawler) return JSON.stringify({ error: 'Crawler not injected' });
+                        var n = window.__mcpCrawler.findNodeByUuid('${args.uuid}');
+                        if(!n) return JSON.stringify({ error: 'NODE_NOT_FOUND', msg: 'Node destroyed or not found' });
+                        var ok = window.__mcpCrawler.updateNodeProperty('${args.uuid}', '${args.compName || "null"}', '${args.propKey}', ${JSON.stringify(args.value)}, ${(_a = args.compIndex) !== null && _a !== void 0 ? _a : -1});
+                        return JSON.stringify({ success: ok });
+                    } catch(e) { return JSON.stringify({ error: 'EXECUTION_FAILED', msg: e.message }); }
+                })();
+            `;
+            wv.executeJavaScript(code).then((r) => { if (event.reply)
+                event.reply(null, typeof r === 'string' ? JSON.parse(r) : r); }).catch((e) => { if (event.reply)
+                event.reply(null, { error: e.message }); });
+        },
+        'mcp-simulate-input'(event, args) {
+            const wv = this.shadowRoot ? this.shadowRoot.querySelector('#game-view') : null;
+            if (!wv) {
+                if (event.reply)
+                    event.reply(null, { error: 'No WebView' });
+                return;
+            }
+            if (typeof wv.isConnected === 'boolean' && !wv.isConnected) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView detached from DOM' });
+                return;
+            }
+            try {
+                wv.getWebContentsId();
+            }
+            catch (e) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView not ready' });
+                return;
+            }
+            const code = `
+                (function(){
+                    try {
+                        if(!window.__mcpCrawler) return JSON.stringify({ error: 'Crawler not injected' });
+                        if(typeof window.__mcpCrawler.simulateInput !== 'function') return JSON.stringify({ error: 'simulateInput not implemented in probe' });
+                        return JSON.stringify(window.__mcpCrawler.simulateInput(${JSON.stringify(args)}));
+                    } catch(e) { return JSON.stringify({ error: 'EXECUTION_FAILED', msg: e.message }); }
+                })();
+            `;
+            wv.executeJavaScript(code).then((r) => { if (event.reply)
+                event.reply(null, typeof r === 'string' ? JSON.parse(r) : r); }).catch((e) => { if (event.reply)
+                event.reply(null, { error: e.message }); });
+        },
+        'mcp-query-memory'(event, args) {
+            const wv = this.shadowRoot ? this.shadowRoot.querySelector('#game-view') : null;
+            if (!wv) {
+                if (event.reply)
+                    event.reply(null, { error: 'No WebView' });
+                return;
+            }
+            if (typeof wv.isConnected === 'boolean' && !wv.isConnected) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView detached from DOM' });
+                return;
+            }
+            try {
+                wv.getWebContentsId();
+            }
+            catch (e) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView not ready' });
+                return;
+            }
+            const code = `
+                 (function(){
+                     try {
+                         if(typeof window.__mcpGetMemoryRanking !== 'function') return JSON.stringify({ error: 'Memory agent not injected' });
+                         return JSON.stringify(window.__mcpGetMemoryRanking());
+                     } catch(e) { return JSON.stringify({ error: 'EXECUTION_FAILED', msg: e.message }); }
+                 })();
+             `;
+            wv.executeJavaScript(code).then((r) => { if (event.reply)
+                event.reply(null, typeof r === 'string' ? JSON.parse(r) : r); }).catch((e) => { if (event.reply)
+                event.reply(null, { error: e.message }); });
+        },
+        'mcp-query-tree'(event, args) {
+            if (!event.reply)
+                return;
+            if (typeof Editor !== 'undefined')
+                Editor.log("[mcp-query-tree] Received request, tree exists:", !!globalState.nodeTree);
+            if (!globalState.nodeTree) {
+                event.reply(null, { error: 'Node tree data is empty or not yet initialized.' });
+                return;
+            }
+            const maxDepth = (args && typeof args.depth === 'number') ? args.depth : 3;
+            let rawTree = null;
+            try {
+                rawTree = JSON.parse(JSON.stringify(globalState.nodeTree));
+            }
+            catch (e) {
+                event.reply(null, { error: 'Tree parse error: ' + e.message });
+                return;
+            }
+            const trimTree = (node, currentDepth) => {
+                if (!node)
+                    return node;
+                const cloned = { ...node };
+                if (currentDepth >= maxDepth) {
+                    if (cloned.children && cloned.children.length > 0) {
+                        cloned.children = [`__TRUNCATED__ (hidden ${cloned.children.length} items, use depth > ${maxDepth} to view)`];
+                    }
+                }
+                else if (cloned.children && Array.isArray(cloned.children)) {
+                    cloned.children = cloned.children.map((c) => trimTree(c, currentDepth + 1));
+                }
+                return cloned;
+            };
+            const trimmedTree = trimTree(rawTree, 1);
+            if (typeof Editor !== 'undefined')
+                Editor.log("[mcp-query-tree] Trimmed tree, replying...");
+            event.reply(null, trimmedTree);
+        },
+        'mcp-query-logs'(event, args) {
+            const wv = this.shadowRoot ? this.shadowRoot.querySelector('#game-view') : null;
+            if (!wv) {
+                if (event.reply)
+                    event.reply(null, { error: 'No WebView' });
+                return;
+            }
+            if (typeof wv.isConnected === 'boolean' && !wv.isConnected) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView detached from DOM' });
+                return;
+            }
+            try {
+                wv.getWebContentsId();
+            }
+            catch (e) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView not ready' });
+                return;
+            }
+            const tailCount = Math.min((args === null || args === void 0 ? void 0 : args.tail) || 50, 100);
+            const filterLevel = (args === null || args === void 0 ? void 0 : args.level) || 'all';
+            const code = `
+                (function(){
+                    try {
+                        if(!window.__mcpRuntimeLogs) return JSON.stringify({ error: 'Logs not intercepted' });
+                        var list = window.__mcpRuntimeLogs;
+                        if ('${filterLevel}' !== 'all') {
+                            list = list.filter(l => l.type === '${filterLevel}');
+                        }
+                        return JSON.stringify(list.slice(-${tailCount}));
+                    } catch(e) { return JSON.stringify({ error: e.message }); }
+                })();
+            `;
+            wv.executeJavaScript(code)
+                .then((r) => { if (event.reply)
+                event.reply(null, typeof r === 'string' ? JSON.parse(r) : r); })
+                .catch((e) => { if (event.reply)
+                event.reply(null, { error: e.message }); });
+        },
+        'mcp-query-stats'(event, args) {
+            const wv = this.shadowRoot ? this.shadowRoot.querySelector('#game-view') : null;
+            if (!wv) {
+                if (event.reply)
+                    event.reply(null, { error: 'No WebView' });
+                return;
+            }
+            if (typeof wv.isConnected === 'boolean' && !wv.isConnected) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView detached from DOM' });
+                return;
+            }
+            try {
+                wv.getWebContentsId();
+            }
+            catch (e) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView not ready' });
+                return;
+            }
+            const code = `
+                (function(){
+                    try {
+                        if(typeof window.__mcpProfilerTick !== 'function') return JSON.stringify({ error: 'Profiler not injected' });
+                        return JSON.stringify(window.__mcpProfilerTick());
+                    } catch(e) { return JSON.stringify({ error: 'EXECUTION_FAILED', msg: e.message }); }
+                })();
+            `;
+            wv.executeJavaScript(code)
+                .then((r) => { if (event.reply)
+                event.reply(null, typeof r === 'string' ? JSON.parse(r) : r); })
+                .catch((e) => { if (event.reply)
+                event.reply(null, { error: e.message }); });
+        },
+        // --- 性能分析工具 IPC 处理 (Phase 4) ---
+        'mcp-query-frame-timeline'(event, args) {
+            const wv = this.shadowRoot ? this.shadowRoot.querySelector('#game-view') : null;
+            if (!wv) {
+                if (event.reply)
+                    event.reply(null, { error: 'No WebView' });
+                return;
+            }
+            if (typeof wv.isConnected === 'boolean' && !wv.isConnected) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView detached from DOM' });
+                return;
+            }
+            try {
+                wv.getWebContentsId();
+            }
+            catch (e) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView not ready' });
+                return;
+            }
+            const limit = (args === null || args === void 0 ? void 0 : args.limit) || 600;
+            const code = `
+                (function(){
+                    try {
+                        if(typeof window.__mcpGetFrameTimeline !== 'function') return JSON.stringify({ error: 'FrameTimeline not injected' });
+                        var data = window.__mcpGetFrameTimeline();
+                        if (data.frameTimes && data.frameTimes.length > ${limit}) {
+                            data.frameTimes = data.frameTimes.slice(-${limit});
+                        }
+                        return JSON.stringify(data);
+                    } catch(e) { return JSON.stringify({ error: 'EXECUTION_FAILED', msg: e.message }); }
+                })();
+            `;
+            wv.executeJavaScript(code)
+                .then((r) => { if (event.reply)
+                event.reply(null, typeof r === 'string' ? JSON.parse(r) : r); })
+                .catch((e) => { if (event.reply)
+                event.reply(null, { error: e.message }); });
+        },
+        'mcp-query-memory-timeline'(event, args) {
+            const wv = this.shadowRoot ? this.shadowRoot.querySelector('#game-view') : null;
+            if (!wv) {
+                if (event.reply)
+                    event.reply(null, { error: 'No WebView' });
+                return;
+            }
+            if (typeof wv.isConnected === 'boolean' && !wv.isConnected) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView detached from DOM' });
+                return;
+            }
+            try {
+                wv.getWebContentsId();
+            }
+            catch (e) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView not ready' });
+                return;
+            }
+            const code = `
+                (function(){
+                    try {
+                        if(typeof window.__mcpGetMemoryTimeline !== 'function') return JSON.stringify({ error: 'MemoryTimeline not injected' });
+                        return JSON.stringify(window.__mcpGetMemoryTimeline());
+                    } catch(e) { return JSON.stringify({ error: 'EXECUTION_FAILED', msg: e.message }); }
+                })();
+            `;
+            wv.executeJavaScript(code)
+                .then((r) => { if (event.reply)
+                event.reply(null, typeof r === 'string' ? JSON.parse(r) : r); })
+                .catch((e) => { if (event.reply)
+                event.reply(null, { error: e.message }); });
+        },
+        'mcp-query-leak-report'(event, args) {
+            const wv = this.shadowRoot ? this.shadowRoot.querySelector('#game-view') : null;
+            if (!wv) {
+                if (event.reply)
+                    event.reply(null, { error: 'No WebView' });
+                return;
+            }
+            if (typeof wv.isConnected === 'boolean' && !wv.isConnected) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView detached from DOM' });
+                return;
+            }
+            try {
+                wv.getWebContentsId();
+            }
+            catch (e) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView not ready' });
+                return;
+            }
+            const code = `
+                (function(){
+                    try {
+                        if(typeof window.__mcpDetectMemoryLeak !== 'function') return JSON.stringify({ error: 'LeakDetection not injected' });
+                        return JSON.stringify(window.__mcpDetectMemoryLeak());
+                    } catch(e) { return JSON.stringify({ error: 'EXECUTION_FAILED', msg: e.message }); }
+                })();
+            `;
+            wv.executeJavaScript(code)
+                .then((r) => { if (event.reply)
+                event.reply(null, typeof r === 'string' ? JSON.parse(r) : r); })
+                .catch((e) => { if (event.reply)
+                event.reply(null, { error: e.message }); });
+        },
+        'mcp-reset-perf-baseline'(event, args) {
+            const wv = this.shadowRoot ? this.shadowRoot.querySelector('#game-view') : null;
+            if (!wv) {
+                if (event.reply)
+                    event.reply(null, { error: 'No WebView' });
+                return;
+            }
+            if (typeof wv.isConnected === 'boolean' && !wv.isConnected) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView detached from DOM' });
+                return;
+            }
+            try {
+                wv.getWebContentsId();
+            }
+            catch (e) {
+                if (event.reply)
+                    event.reply(null, { error: 'WebView not ready' });
+                return;
+            }
+            const code = `
+                (function(){
+                    try {
+                        if(typeof window.__mcpSetLeakBaseline !== 'function') return JSON.stringify({ error: 'Baseline API not injected' });
+                        return JSON.stringify(window.__mcpSetLeakBaseline());
+                    } catch(e) { return JSON.stringify({ error: 'EXECUTION_FAILED', msg: e.message }); }
+                })();
+            `;
+            wv.executeJavaScript(code)
+                .then((r) => { if (event.reply)
+                event.reply(null, typeof r === 'string' ? JSON.parse(r) : r); })
+                .catch((e) => { if (event.reply)
+                event.reply(null, { error: e.message }); });
+        },
+        'scene-status-changed'(event, payload) {
+            window.dispatchEvent(new CustomEvent('scene-status-changed', { detail: payload }));
+        },
+        'mcp-inspector-bridge:mcp-log'(event, logItem) {
+            globalState.mcpLogs.push(logItem);
+            if (globalState.mcpLogs.length > 200) {
+                globalState.mcpLogs.shift();
+            }
+        },
+        'mcp-status-changed'(event, payload) {
+            window.dispatchEvent(new CustomEvent('mcp-status-changed', { detail: payload }));
+        },
+        'mcp-script-install'(event, args) {
+            const fn = args.name.endsWith('.user.js') ? args.name : args.name + '.user.js';
+            if (typeof Editor !== 'undefined') {
+                Editor.Ipc.sendToMain('mcp-inspector-bridge:script-save-file', { fileName: fn, content: args.code }, () => {
+                    const result = _scriptSystem ? _scriptSystem.loadScript(fn, args.code) : { success: false, error: '脚本系统未初始化' };
+                    if (event.reply)
+                        event.reply(null, {
+                            success: result.success,
+                            message: result.success ? '脚本已安装并启用' : ('安装失败: ' + result.error),
+                        });
+                });
+            }
+            else {
+                const result = _scriptSystem ? _scriptSystem.loadScript(fn, args.code) : { success: false, error: '脚本系统未初始化' };
+                if (event.reply)
+                    event.reply(null, {
+                        success: result.success,
+                        message: result.success ? '脚本已安装并启用' : ('安装失败: ' + result.error),
+                    });
+            }
+        },
+        'mcp-script-enable'(event, args) {
+            const fn = args.name.endsWith('.user.js') ? args.name : args.name + '.user.js';
+            if (typeof Editor !== 'undefined') {
+                Editor.Ipc.sendToMain('mcp-inspector-bridge:script-read-file', { fileName: fn }, (err, data) => {
+                    if (data && data.content && _scriptSystem) {
+                        const result = _scriptSystem.enableScript(fn, data.content);
+                        if (event.reply)
+                            event.reply(null, {
+                                success: result.success,
+                                message: result.success ? '脚本已启用' : ('启用失败: ' + result.error),
+                            });
+                    }
+                    else {
+                        if (event.reply)
+                            event.reply(null, { success: false, message: '脚本文件不存在: ' + fn });
+                    }
+                });
+            }
+        },
+        'mcp-script-disable'(event, args) {
+            const fn = args.name.endsWith('.user.js') ? args.name : args.name + '.user.js';
+            if (_scriptSystem)
+                _scriptSystem.disableScript(fn);
+            if (event.reply)
+                event.reply(null, { success: true, message: '脚本已停用' });
+        },
+        'mcp-script-list'(event) {
+            if (event.reply)
+                event.reply(null, {
+                    scripts: globalState.scriptList.map((s) => ({
+                        name: s.name,
+                        fileName: s.fileName,
+                        version: s.version,
+                        description: s.description,
+                        author: s.author,
+                        status: s.status,
+                        grants: s.grants,
+                        toolCount: s.toolCount,
+                    })),
+                });
+        },
+        'mcp-refresh-preview'(event) {
+            if (!_refreshGameFn) {
+                if (event.reply)
+                    event.reply(null, { success: false, message: "刷新函数未初始化，面板可能尚未加载完成" });
+                return;
+            }
+            if (!globalState.isEditorSceneActive) {
+                if (event.reply)
+                    event.reply(null, { success: false, message: "场景编辑器未激活，无法刷新预览" });
+                return;
+            }
+            try {
+                _refreshGameFn();
+                if (event.reply)
+                    event.reply(null, { success: true, message: "预览已刷新" });
+            }
+            catch (e) {
+                if (event.reply)
+                    event.reply(null, { success: false, message: "刷新失败: " + e.message });
+            }
+        },
+        'switch-run-mode'(event, mode) {
+            if (_gameViewSystem && typeof _gameViewSystem.switchRunMode === 'function') {
+                _gameViewSystem.switchRunMode(mode);
+            }
+        },
+    },
+    show() {
+        try {
+            window.dispatchEvent(new CustomEvent('panel-show'));
+        }
+        catch (e) { }
+    },
+    hide() {
+        try {
+            window.dispatchEvent(new CustomEvent('panel-hide'));
+        }
+        catch (e) { }
+    },
+    close() {
+        try {
+            window.dispatchEvent(new CustomEvent('panel-close'));
+        }
+        catch (e) { }
+        if (this._vueApp) {
+            try {
+                this._vueApp.unmount();
+            }
+            catch (e) { }
+            this._vueApp = null;
+        }
+    }
+});
+//# sourceMappingURL=index.js.map

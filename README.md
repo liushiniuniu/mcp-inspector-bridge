@@ -93,7 +93,7 @@ npm run build
 
 - **极值水位追踪**：实时记录每个 Bundle 的历史最高/最低内存，趋势箭头（↑↓）即时预警
 - **UUID 逆向解码**：自动将混淆的 UUID 还原为 `db://assets/textures/...` 可读路径
-- **一键资源定位 🎯**：点击即可在编辑器资源管理器中高亮对应文件
+- **一键资源定位 / 打开 🎯**：点击在编辑器资源管理器中高亮对应文件；预制体会顺带在编辑器里**自动打开**（进入预制体编辑模式），通道 `asset-db/open-asset` → `scene/enter-prefab-edit-mode` 逐级降级，Creator 控制台会打印实际命中的通道
 - **宏观内存汇总**：榜单头部实时聚合由底层探针累加的总体内存消耗
 
 ### 🩺 渲染调试器
@@ -159,6 +159,14 @@ npm run build
 - **FPS 叠加框开关** (替代引擎内置 FPS，控制插件叠加框显隐)
 - 全局静音
 
+### ⌨️ 预览区按 R 刷新
+
+点一下预览区的空白底板（游戏容器外围的深灰区域）让面板获得焦点，然后按 `R` 或 `r`，即可重载**正在调试的游戏页面** —— 与点刷新按钮完全同一条链路（`refreshGame()`：按运行模式重算 URL、重置节点树缓存），不会重载整个编辑器窗口。
+
+- **不抢游戏输入**：只认「空白底板有焦点」这一种情况。焦点在游戏画布内时 `R` 照旧交给游戏；点击画布也不会把焦点抢到面板。
+- **防连刷**：500ms 内重复按只刷一次（webview 重建开销大）。
+- **组合键不动**：`Cmd/Ctrl+R`、`Alt+R` 不做处理，保持原行为。
+
 ### 📐 自定义预览分辨率
 
 在偏好设置面板（⚙️ 设置标签页）中管理全局自定义分辨率预设，出现在预览窗口下拉菜单的「自定义」分组中：
@@ -223,6 +231,26 @@ npm run build
 探针本身不会主动创建 WebGL 上下文，只复用引擎创建的上下文，避免抢占上下文属性导致模板缓冲丢失。需要查看探针底层日志时设置 `window.__MCP_DEBUG__ = true`。
 
 ---
+
+## 👤 账号自动登录（内嵌）
+
+从 `Tools/AccountAutoLogin/accountAutoLogin.user.js`（油猴脚本）移植进来的开发登录助手，界面在**面板自己的 DOM** 里
+（入口按钮在预览区右上角、录屏按钮的下方），所以不受预览 webview 设备帧 `transform: scale(k)` 和浏览器整页缩放影响，
+字号永远是面板字号。
+
+- **页面侧引擎**：`src/probe/account-login.ts` → 打进 `dist/probe.js`，在 webview 里暴露 `window.__mcpAccountLogin`；
+  按脚本名采集 DevLoginOptions 面板、写入线路/服务器/Device ID、点登录、改 `devServerWXPay`、跑一键开新号。
+  项目模块（`DevConfigController` / `NET` / `RequestId` / `GLOBAL` / `DATA` / `UIManager`）由探针自己挂钩
+  `cc._RF.push` 按脚本名捕获 —— 预览页的项目脚本是 `boot.js` 在 `window.onload` 里加载的，探针在
+  DOMContentLoaded 注入，足够早。**不要改到 preload 里做**：webview 的 preload 跑在隔离世界，
+  它挂的 `window.cc` 页面看不到（这也是探针要用 `<script>` 注入的原因）。
+- **面板侧 UI**：`src/panel/composables/useAccountLogin.ts` + `src/panel/index.html` 里的浮层，
+  每秒轮询一次 `window.__mcpAccountLogin.state()`，指令用 `executeJavaScript` 下发，提示走
+  `postMessage({__mcp_ipc_proxy:true, channel:'account-login:toast'})` 经 preload 转到面板。
+- **账号数据**：存在 webview 页面的 localStorage（键 `devLoginAccounts`），换预览地址（origin）就是另一份。
+- **自检**：`npm run check:account`（不需要 Creator，直接跑引擎与 composable）。
+
+引擎部分是脚本化移植的，**不要手改 `src/probe/account-login.ts` 的引擎段**；改油猴脚本后重新生成即可。
 
 ## 🛡️ 稳定性保障
 

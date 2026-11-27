@@ -43,7 +43,7 @@ export const NodeInspector = {
                             <input type="checkbox" class="enable-toggle" :checked="nodeDetail.active" @change="onUpdateProp(null, 'active', $event.target.checked)" title="激活/禁用节点" />
                             <div style="flex: 1; min-width: 0; margin-left: 8px; margin-right: 8px; display: flex; align-items: center;">
                                 <input type="text" :value="nodeDetail.name" @change="onUpdateProp(null, 'name', $event.target.value)" style="width: 100%; box-sizing: border-box; padding: 2px 4px; background: var(--bg-input); color: var(--text-main); border: 1px solid transparent; border-radius: var(--radius); min-width: 0; outline: none; transition: border-color 0.2s;" onfocus="this.style.borderColor='var(--accent-blue)'" onblur="this.style.borderColor='transparent'" />
-                                <span v-if="nodeDetail.prefabUuid" @click.stop="$emit('locate-asset', nodeDetail.prefabUuid)" style="cursor: pointer; font-size: 14px; margin-left: 8px; color: var(--accent-blue); filter: drop-shadow(0 0 4px var(--accent-blue));" title="在资源管理器中定位预制体">🎯</span>
+                                <span v-if="nodeDetail.prefabUuid" @click.stop="$emit('locate-asset', nodeDetail.prefabUuid, 'prefab')" style="cursor: pointer; font-size: 14px; margin-left: 8px; color: var(--accent-blue); filter: drop-shadow(0 0 4px var(--accent-blue));" title="在资源管理器中定位并打开预制体">🎯</span>
                             </div>
                             <div class="header-right">
                                 <span class="print-btn" @click.stop="onExportPsd" title="导出该节点及子树为 PSD 布局文件" style="cursor: pointer; margin-right: 6px;">📂</span>
@@ -424,8 +424,8 @@ export const NodeInspector = {
       emit("locate-node", uuid);
     };
 
-    const onLocateAssetRef = (uuid: string) => {
-      emit("locate-asset", uuid);
+    const onLocateAssetRef = (uuid: string, kind?: string) => {
+      emit("locate-asset", uuid, kind);
     };
 
     const onPrintComponent = (uuid: string, compIndex: number) => {

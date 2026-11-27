@@ -9,6 +9,14 @@ export const globalState = reactive({
     devToolsError: null as string | null,
     nodeDetail: null as any,
     isGamePaused: false as boolean,
+    // 账号自动登录（内嵌）：页面侧引擎的状态镜像 + 面板 UI 开关
+    accountLogin: {
+        open: false as boolean,
+        ready: false as boolean,
+        data: null as any,
+        lastToast: null as any,
+        lastUpdate: 0 as number
+    },
     isNarrow: false as boolean,
     webviewSrc: '' as string,
     profiler: {

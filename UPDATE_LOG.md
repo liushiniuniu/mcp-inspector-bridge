@@ -1,5 +1,17 @@
 # 更新日志 (Update Log)
 
+## [Unreleased] - 2026-11-27
+
+### ⌨️ 预览区空白处按 R 刷新游戏视图 (Press R in Preview Blank Area to Reload)
+
+- **需求**：改完代码/资源想重新进游戏，但编辑器自带的 `Cmd+R` 会把整个编辑器窗口一起重载，代价太大；而用户希望的是「在预览区空白位置敲一下 R 就重进游戏」。
+- **方案**：新增 `src/panel/composables/usePreviewHotkey.ts`。给 `#game-mount-wrap`（游戏容器外围的深灰底板）加 `tabindex="-1"`，点击空白处即可获得焦点；在该容器上监听 `keydown`，命中 `r` / `R`（无 `Cmd/Ctrl/Alt`、非输入法组合中）时 `preventDefault()` 并调用既有 `refreshGame()`，与刷新按钮同一条链路。
+- **边界**：
+  - 焦点在游戏画布（webview）内时完全不介入，游戏自己的 `R` 键照常生效；`pointerdown` 落在 webview 上时不抢焦点。
+  - 500ms 防抖，避免按住不放反复重建 webview。
+  - 焦点在工具栏输入框、其它标签页时均不响应；容器未就绪时 `install()` 只告警不抛错。
+- **验证**：`npm run build` 通过；以假 DOM 驱动编译产物，15 项断言全部 PASS（空白区聚焦、画布不抢焦点、r/R 触发、防抖、修饰键放行、非预览区焦点不触发、`install` 幂等）。
+
 ## [Unreleased] - 2026-11-16
 
 ### 🐛 缺陷修复

@@ -8,6 +8,8 @@ import { initMemory } from './memory';
 import { initRenderDebugger } from './render-debugger';
 import { initPicker } from './picker';
 import { initMaskDiagnostics } from './mask-diag';
+// 开发登录账号助手（内嵌预览面板用）：自带幂等守卫，只会在页面里装一次
+import './account-login';
 
 import { getCcEngine } from './engine-helper';
 

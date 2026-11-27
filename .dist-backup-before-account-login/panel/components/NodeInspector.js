@@ -1,0 +1,438 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.NodeInspector = void 0;
+const { ref, watch, computed } = require("vue");
+const { WidgetVisualizer } = require("./WidgetVisualizer");
+exports.NodeInspector = {
+    props: {
+        nodeDetail: {
+            type: Object,
+            default: null,
+        },
+    },
+    emits: [
+        "update-prop",
+        "hover-change",
+        "focus-change",
+        "locate-node",
+        "locate-asset",
+        "print-comp",
+        "print-node",
+        "export-psd",
+    ],
+    template: `
+        <div class="node-inspector-wrap" style="padding: 10px; overflow-y: auto; height: 100%; color: #d0d0d0;"
+             @mouseenter="onHover(true)" @mouseleave="onHover(false)"
+             @focusin="onFocusChange(true)" @focusout="onFocusChange(false)">
+
+            <div v-if="!nodeDetail" class="empty-hint" style="text-align: center; margin-top: 50px; color: #888;">
+                未选中任何节点 (No node selected)
+            </div>
+            
+            <div v-else class="inspector-content">
+                
+                <!-- 场景节点专属显示区块 -->
+                <div v-if="nodeDetail.isScene" class="inspector-section scene-hint" style="background: #2b2b2b; padding: 30px 10px; border-radius: 4px; border: 1px solid #444; margin-bottom: 10px; text-align: center; color: #aaa;">
+                    <div style="font-size: 32px; margin-bottom: 12px; filter: grayscale(0.5);">🌍</div>
+                    <div style="font-weight: bold; font-size: 14px; color: #ddd; margin-bottom: 6px;">[场景] {{ nodeDetail.name }}</div>
+                    <div style="font-size: 12px; opacity: 0.7;">场景根节点不可直接编辑变换属性</div>
+                </div>
+
+                <!-- 常规节点属性区块 -->
+                <template v-else>
+                    <div class="inspector-card node-basics">
+                        <div class="component-header">
+                            <input type="checkbox" class="enable-toggle" :checked="nodeDetail.active" @change="onUpdateProp(null, 'active', $event.target.checked)" title="激活/禁用节点" />
+                            <div style="flex: 1; min-width: 0; margin-left: 8px; margin-right: 8px; display: flex; align-items: center;">
+                                <input type="text" :value="nodeDetail.name" @change="onUpdateProp(null, 'name', $event.target.value)" style="width: 100%; box-sizing: border-box; padding: 2px 4px; background: var(--bg-input); color: var(--text-main); border: 1px solid transparent; border-radius: var(--radius); min-width: 0; outline: none; transition: border-color 0.2s;" onfocus="this.style.borderColor='var(--accent-blue)'" onblur="this.style.borderColor='transparent'" />
+                                <span v-if="nodeDetail.prefabUuid" @click.stop="$emit('locate-asset', nodeDetail.prefabUuid)" style="cursor: pointer; font-size: 14px; margin-left: 8px; color: var(--accent-blue); filter: drop-shadow(0 0 4px var(--accent-blue));" title="在资源管理器中定位预制体">🎯</span>
+                            </div>
+                            <div class="header-right">
+                                <span class="print-btn" @click.stop="onExportPsd" title="导出该节点及子树为 PSD 布局文件" style="cursor: pointer; margin-right: 6px;">📂</span>
+                                <span class="print-btn" @click.stop="onPrintNode" title="在控制台直接打印该节点对象" style="cursor: pointer; margin-right: 6px;">🖨️</span>
+                                <span class="size-tag" style="background: rgba(0,0,0,0.3); border-color: transparent;">Node</span>
+                            </div>
+                        </div>
+                    
+                        <div class="properties-body" style="padding: 10px;">
+                            <div class="transform-grid" style="display: grid; grid-template-columns: 78px 1fr 1fr; gap: 6px; align-items: center; font-size: 12px;">
+                                <!-- Position -->
+                                <span style="color: var(--text-muted);">position</span>
+                                <div class="prop-input-wrap" style="display: flex; align-items: center;">
+                                    <span style="color: #ff6b6b; margin-right: 4px;">x</span>
+                                    <input type="number" step="1" :value="formatNumber(nodeDetail.x)" @change="onUpdateProp(null, 'x', parseFloat($event.target.value))" style="width: 100%; padding: 2px 4px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); border-radius: var(--radius); min-width: 0; box-sizing: border-box;" />
+                                </div>
+                                <div class="prop-input-wrap" style="display: flex; align-items: center;">
+                                    <span style="color: #69b02a; margin-right: 4px;">y</span>
+                                    <input type="number" step="1" :value="formatNumber(nodeDetail.y)" @change="onUpdateProp(null, 'y', parseFloat($event.target.value))" style="width: 100%; padding: 2px 4px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); border-radius: var(--radius); min-width: 0; box-sizing: border-box;" />
+                                </div>
+                                
+                                <!-- Rotation -->
+                                <span style="color: var(--text-muted);">{{ nodeDetail.hasAngle ? 'angle' : 'rotation' }}</span>
+                                <div class="prop-input-wrap" style="display: flex; align-items: center; grid-column: span 2;">
+                                    <span style="color: #4fa1ff; margin-right: 4px;">∠</span>
+                                    <input type="number" step="1" :value="formatNumber(nodeDetail.rotation)" @change="onUpdateProp(null, 'rotation', parseFloat($event.target.value))" style="width: 100%; padding: 2px 4px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); border-radius: var(--radius); min-width: 0; box-sizing: border-box;" />
+                                </div>
+
+                                <!-- Scale -->
+                                <span style="color: var(--text-muted);">scale</span>
+                                <div class="prop-input-wrap" style="display: flex; align-items: center;">
+                                    <span style="color: #ff6b6b; margin-right: 4px;">x</span>
+                                    <input type="number" step="0.1" :value="formatNumber(nodeDetail.scaleX)" @change="onUpdateProp(null, 'scaleX', parseFloat($event.target.value))" style="width: 100%; padding: 2px 4px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); border-radius: var(--radius); min-width: 0; box-sizing: border-box;" />
+                                </div>
+                                <div class="prop-input-wrap" style="display: flex; align-items: center;">
+                                    <span style="color: #69b02a; margin-right: 4px;">y</span>
+                                    <input type="number" step="0.1" :value="formatNumber(nodeDetail.scaleY)" @change="onUpdateProp(null, 'scaleY', parseFloat($event.target.value))" style="width: 100%; padding: 2px 4px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); border-radius: var(--radius); min-width: 0; box-sizing: border-box;" />
+                                </div>
+
+                                <!-- Anchor -->
+                                <span style="color: var(--text-muted);">anchorPoint</span>
+                                <div class="prop-input-wrap" style="display: flex; align-items: center;">
+                                    <span style="color: #ff6b6b; margin-right: 4px;">x</span>
+                                    <input type="number" step="0.1" :value="formatNumber(nodeDetail.anchorX)" @change="onUpdateProp(null, 'anchorX', parseFloat($event.target.value))" style="width: 100%; padding: 2px 4px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); border-radius: var(--radius); min-width: 0; box-sizing: border-box;" />
+                                </div>
+                                <div class="prop-input-wrap" style="display: flex; align-items: center;">
+                                    <span style="color: #69b02a; margin-right: 4px;">y</span>
+                                    <input type="number" step="0.1" :value="formatNumber(nodeDetail.anchorY)" @change="onUpdateProp(null, 'anchorY', parseFloat($event.target.value))" style="width: 100%; padding: 2px 4px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); border-radius: var(--radius); min-width: 0; box-sizing: border-box;" />
+                                </div>
+
+                                <!-- Size -->
+                                <span style="color: var(--text-muted);">contentSize</span>
+                                <div class="prop-input-wrap" style="display: flex; align-items: center;">
+                                    <span style="color: var(--text-muted); margin-right: 4px;">width</span>
+                                    <input type="number" step="1" :value="formatNumber(nodeDetail.width)" @change="onUpdateProp(null, 'width', parseFloat($event.target.value))" style="width: 100%; padding: 2px 4px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); border-radius: var(--radius); min-width: 0; box-sizing: border-box;" />
+                                </div>
+                                <div class="prop-input-wrap" style="display: flex; align-items: center;">
+                                    <span style="color: var(--text-muted); margin-right: 4px;">height</span>
+                                    <input type="number" step="1" :value="formatNumber(nodeDetail.height)" @change="onUpdateProp(null, 'height', parseFloat($event.target.value))" style="width: 100%; padding: 2px 4px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); border-radius: var(--radius); min-width: 0; box-sizing: border-box;" />
+                                </div>
+
+                                <!-- Color -->
+                                <span style="color: var(--text-muted);">color</span>
+                                <div class="prop-input-wrap" style="display: flex; align-items: center; grid-column: span 2;">
+                                    <input type="color" :value="nodeDetail.color ? nodeDetail.color.substring(0, 7) : '#ffffff'" @change="onUpdateProp(null, 'color', $event.target.value)" style="width: 24px; height: 24px; padding: 0; border: none; background: transparent; cursor: pointer; margin-right: 6px;" />
+                                    <input type="text" :value="nodeDetail.color" @change="onUpdateProp(null, 'color', $event.target.value)" style="flex: 1; padding: 2px 4px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); border-radius: var(--radius); min-width: 0; box-sizing: border-box;" />
+                                </div>
+
+                                <!-- Opacity -->
+                                <span style="color: var(--text-muted);">opacity</span>
+                                <div class="prop-input-wrap" style="display: flex; align-items: center; grid-column: span 2;">
+                                    <input type="number" step="1" :value="nodeDetail.opacity" @change="onUpdateProp(null, 'opacity', parseInt($event.target.value) || 0)" min="0" max="255" style="width: 100%; padding: 2px 4px; background: var(--bg-input); color: #ff9800; border: 1px solid var(--border-color); border-radius: var(--radius); min-width: 0; box-sizing: border-box; font-weight: bold;" />
+                                </div>
+
+                                <!-- Skew -->
+                                <span style="color: var(--text-muted);">skew</span>
+                                <div class="prop-input-wrap" style="display: flex; align-items: center;">
+                                    <span style="color: #ff6b6b; margin-right: 4px;">x</span>
+                                    <input type="number" step="1" :value="formatNumber(nodeDetail.skewX)" @change="onUpdateProp(null, 'skewX', parseFloat($event.target.value))" style="width: 100%; padding: 2px 4px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); border-radius: var(--radius); min-width: 0; box-sizing: border-box;" />
+                                </div>
+                                <div class="prop-input-wrap" style="display: flex; align-items: center;">
+                                    <span style="color: #69b02a; margin-right: 4px;">y</span>
+                                    <input type="number" step="1" :value="formatNumber(nodeDetail.skewY)" @change="onUpdateProp(null, 'skewY', parseFloat($event.target.value))" style="width: 100%; padding: 2px 4px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); border-radius: var(--radius); min-width: 0; box-sizing: border-box;" />
+                                </div>
+
+                                <!-- Group -->
+                                <span style="color: var(--text-muted);">groupIndex</span>
+                                <div class="prop-input-wrap" style="display: flex; align-items: center; grid-column: span 2;">
+                                    <select v-if="nodeDetail.groupList && nodeDetail.groupList.length > 0" :value="nodeDetail.groupIndex" @change="onUpdateProp(null, 'groupIndex', parseInt($event.target.value))" style="width: 100%; padding: 2px 4px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); border-radius: var(--radius); box-sizing: border-box;">
+                                        <option v-for="(gName, idx) in nodeDetail.groupList" :key="idx" :value="idx">{{ gName }}</option>
+                                    </select>
+                                    <input v-else type="number" step="1" :value="nodeDetail.groupIndex" @change="onUpdateProp(null, 'groupIndex', parseInt($event.target.value) || 0)" style="width: 100%; padding: 2px 4px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); border-radius: var(--radius); min-width: 0; box-sizing: border-box;" />
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                <!-- 组件区块 -->
+                <!-- 组件区块 -->
+                <div v-for="(comp, index) in nodeDetail.components" :key="'comp_'+index" class="inspector-card" :class="{'disabled': !comp.enabled}">
+                    <div class="component-header">
+                        <input type="checkbox" class="enable-toggle" :checked="comp.enabled" @change="onUpdateProp(comp.name, 'enabled', $event.target.checked, comp.realIndex)" title="启用/禁用当前组件">
+                        <span class="component-name" @click="toggleComp(index)" style="cursor: pointer; flex: 1;">{{ comp.name }}</span>
+                        <span v-if="comp.scriptUuid" @click.stop="$emit('locate-asset', comp.scriptUuid)" title="在资源管理器中定位组件脚本" style="cursor: pointer; margin-right: 6px; color: var(--accent-blue); filter: drop-shadow(0 0 4px var(--accent-blue));">🎯</span>
+                        <span class="print-btn" @click.stop="onPrintComponent(nodeDetail.id, comp.realIndex)" title="将当前组件数据打印/导出为JSON">🖨️</span>
+                        <div class="header-right" @click="toggleComp(index)" style="cursor: pointer;">
+                            <span class="size-tag">属性: {{ comp.properties ? comp.properties.length : 0 }}</span>
+                            <span style="font-size: 10px; color: #888;">{{ expandedComps[index] ? '▼' : '◀' }}</span>
+                        </div>
+                    </div>
+                    
+                    <div v-show="expandedComps[index]" class="properties-body">
+                        <div v-if="comp.name === 'cc.Widget' || comp.name === 'Widget' || comp.name === 'Widget<cc.Widget>'" style="padding: 0 12px;">
+                            <widget-visualizer :comp="comp" @update-prop="(k, v) => onUpdateProp(comp.name, k, v, comp.realIndex)" />
+                        </div>
+                        <div v-else>
+                            <div v-if="comp.properties.length === 0" style="color: #666; font-size: 12px; font-style: italic; padding: 0 12px;">
+                                无公开基础属性
+                            </div>
+                            <template v-else v-for="prop in comp.properties" :key="prop.key">
+                                <div class="prop-row" v-if="prop.type !== 'array'">
+                                    <span class="prop-label" :title="prop.key">{{ prop.name || prop.key }}</span>
+                                    <div class="prop-val">
+                                        <!-- Boolean -->
+                                        <input v-if="prop.type === 'boolean'" type="checkbox" :checked="prop.value" @change="onUpdateProp(comp.name, prop.key, $event.target.checked, comp.realIndex)" style="accent-color: var(--accent-blue);" />
+                                        
+                                        <!-- Number -->
+                                        <input v-else-if="prop.type === 'number'" type="number" step="0.1" :value="formatNumber(prop.value)" @change="onUpdateProp(comp.name, prop.key, parseFloat($event.target.value), comp.realIndex)" />
+
+                                        <!-- Enum -->
+                                        <select v-else-if="prop.type === 'Enum'" :value="prop.value" @change="onUpdateProp(comp.name, prop.key, parseInt($event.target.value), comp.realIndex)">
+                                            <option v-for="opt in prop.enumList" :key="opt.value" :value="opt.value">{{ opt.name }}</option>
+                                        </select>
+                                        
+                                        <!-- String / Enum -->
+                                        <template v-else-if="prop.type === 'string'">
+                                            <select v-if="prop.enumList" :value="prop.value || '<None>'" @change="onUpdateProp(comp.name, prop.key, $event.target.value === '<None>' ? '' : $event.target.value, comp.realIndex)">
+                                                <option v-for="opt in prop.enumList" :key="opt" :value="opt">{{ opt }}</option>
+                                            </select>
+                                            <textarea v-else :value="prop.value" @change="onUpdateProp(comp.name, prop.key, $event.target.value, comp.realIndex)" rows="1" class="prop-string-textarea"></textarea>
+                                        </template>
+                                        
+                                        <!-- Node Ref -->
+                                        <div v-else-if="prop.type === 'node_ref'" class="asset-link" @click.stop="onLocateNodeRef(prop.value.uuid)">
+                                            <span style="font-size: 11px; padding: 0 2px;">📦</span>
+                                            <span class="asset-name" :title="prop.value.uuid">{{ prop.value.name }} <span style="color:#777;font-size:9px;">[Node]</span></span>
+                                            <span v-if="prop.value.uuid && prop.value.uuid !== ''" class="target-mark">🎯</span>
+                                        </div>
+
+                                        <!-- Asset Ref -->
+                                        <div v-else-if="prop.type === 'asset_ref'" class="asset-link" @click.stop="onLocateAssetRef(prop.value.uuid)">
+                                            <span style="font-size: 11px; padding: 0 2px;">{{ prop.value.className === 'cc.SpriteFrame' || prop.value.className === 'cc.Texture2D' ? '🖼️' : '🧩' }}</span>
+                                            <span class="asset-name" :title="prop.value.uuid">{{ prop.value.name }} <span style="color:#777;font-size:9px;">[{{ prop.value.className }}]</span></span>
+                                            <span v-if="prop.value.uuid && prop.value.uuid !== ''" class="target-mark">🎯</span>
+                                        </div>
+
+                                        <!-- Comp Ref -->
+                                        <div v-else-if="prop.type === 'comp_ref'" class="asset-link" @click.stop="onLocateNodeRef(prop.value.uuid)">
+                                            <span style="font-size: 11px; padding: 0 2px;">🧩</span>
+                                            <span class="asset-name" :title="prop.value.uuid">{{ prop.value.name }} <span style="color:#777;font-size:9px;">[{{ prop.value.className }}]</span></span>
+                                            <span v-if="prop.value.uuid && prop.value.uuid !== ''" class="target-mark">🎯</span>
+                                        </div>
+
+                                        <!-- Vec2 / Size -->
+                                        <div v-else-if="prop.type === 'vec2' || prop.type === 'size'" class="prop-input-wrap" style="display: flex; gap: 4px; flex-wrap: wrap;">
+                                            <span :style="{color: prop.type==='size' ? 'var(--text-muted)' : '#ff6b6b', fontSize: '11px'}">{{ prop.type==='size' ? 'w' : 'x' }}</span>
+                                            <input type="number" step="1" :value="formatNumber(prop.type==='size' ? prop.value.width : prop.value.x)" @change="onUpdateProp(comp.name, prop.key, prop.type==='size' ? {width: parseFloat($event.target.value) || 0, height: prop.value.height} : {x: parseFloat($event.target.value) || 0, y: prop.value.y}, comp.realIndex)" style="width: 50px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); border-radius: var(--radius); box-sizing: border-box; min-width: 0;" />
+                                            <span :style="{color: prop.type==='size' ? 'var(--text-muted)' : '#69b02a', fontSize: '11px'}">{{ prop.type==='size' ? 'h' : 'y' }}</span>
+                                            <input type="number" step="1" :value="formatNumber(prop.type==='size' ? prop.value.height : prop.value.y)" @change="onUpdateProp(comp.name, prop.key, prop.type==='size' ? {width: prop.value.width, height: parseFloat($event.target.value) || 0} : {x: prop.value.x, y: parseFloat($event.target.value) || 0}, comp.realIndex)" style="width: 50px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); border-radius: var(--radius); box-sizing: border-box; min-width: 0;" />
+                                        </div>
+
+                                        <!-- Color -->
+                                        <div v-else-if="prop.type === 'color'" class="prop-input-wrap" style="display: flex; align-items: center; gap: 4px; width: 100%;">
+                                            <input type="color" :value="'#' + prop.value.hex.substring(0, 6)" @change="onUpdateProp(comp.name, prop.key, $event.target.value, comp.realIndex)" style="width: 24px; height: 24px; padding: 0; border: none; background: transparent; cursor: pointer;" />
+                                            <input type="number" step="1" title="Alpha (0-255)" :value="prop.value.a" @change="onUpdateProp(comp.name, prop.key, {r: prop.value.r, g: prop.value.g, b: prop.value.b, a: parseInt($event.target.value)||0}, comp.realIndex)" min="0" max="255" style="width: 40px; background: var(--bg-input); color: #ff9800; border: 1px solid var(--border-color); border-radius: var(--radius); box-sizing: border-box; font-weight: bold; font-size: 11px;" />
+                                        </div>
+                                        
+                                        <!-- Unsupported -->
+                                        <div v-else style="color: #888; font-style: italic; background: #2a2a2a; padding: 2px 4px; font-size: 11px;">
+                                            [不支持的类型]
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Array -->
+                                <div v-else-if="prop.type === 'array'" class="prop-row array-row">
+                                    <div class="array-header" style="display:flex; width: 100%; justify-content: space-between; align-items: center;">
+                                        <span class="prop-label array-label" :title="prop.key">{{ prop.name || prop.key }}</span>
+                                        <div class="array-size" style="font-size: 11px; color:var(--text-muted);">数量: {{ prop.value ? prop.value.length : 0 }}</div>
+                                    </div>
+                                    <div class="array-items" v-if="prop.value && prop.value.length > 0" style="width: 100%; padding-left: 15px; margin-top: 6px; display:flex; flex-direction:column; gap:4px; box-sizing: border-box; min-width: 0;">
+                                        <div v-for="(item, idx) in prop.value" :key="idx" class="array-item-row" style="display: flex; align-items: center; background: rgba(0,0,0,0.2); border: 1px solid var(--border-color); border-radius: var(--radius); padding: 4px; min-width: 0;">
+                                            <span class="array-index" style="font-size: 10px; color:var(--text-muted); width: 28px; text-align: center; margin-right: 4px;">[{{ idx }}]</span>
+                                            
+                                            <template v-if="item && typeof item === 'object' && item.type === 'node_ref'">
+                                                <div class="asset-link" style="flex:1; min-width: 0;" @click.stop="onLocateNodeRef(item.value.uuid)">
+                                                    <span style="font-size: 11px; padding: 0 2px;">📦</span>
+                                                    <span class="asset-name" :title="item.value.uuid">{{ item.value.name }} <span style="color:#777;font-size:9px;">[Node]</span></span>
+                                                    <span v-if="item.value.uuid && item.value.uuid !== ''" class="target-mark">🎯</span>
+                                                </div>
+                                            </template>
+                                            
+                                            <template v-else-if="item && typeof item === 'object' && item.type === 'asset_ref'">
+                                                <div class="asset-link" style="flex:1; min-width: 0;" @click.stop="onLocateAssetRef(item.value.uuid)">
+                                                    <span style="font-size: 11px; padding: 0 2px;">{{ item.value.className === 'cc.SpriteFrame' || item.value.className === 'cc.Texture2D' ? '🖼️' : '🧩' }}</span>
+                                                    <span class="asset-name" :title="item.value.uuid">{{ item.value.name }} <span style="color:#777;font-size:9px;">[{{ item.value.className }}]</span></span>
+                                                    <span v-if="item.value.uuid && item.value.uuid !== ''" class="target-mark">🎯</span>
+                                                </div>
+                                            </template>
+                                            
+                                            <template v-else-if="item && typeof item === 'object' && item.type === 'comp_ref'">
+                                                <div class="asset-link" style="flex:1; min-width: 0;" @click.stop="onLocateNodeRef(item.value.uuid)">
+                                                    <span style="font-size: 11px; padding: 0 2px;">🧩</span>
+                                                    <span class="asset-name" :title="item.value.uuid">{{ item.value.name }} <span style="color:#777;font-size:9px;">[{{ item.value.className }}]</span></span>
+                                                    <span v-if="item.value.uuid && item.value.uuid !== ''" class="target-mark">🎯</span>
+                                                </div>
+                                            </template>
+                                            
+                                            <template v-else-if="item && typeof item === 'object' && (item.type === 'vec2' || item.type === 'size')">
+                                                <div style="display: flex; gap: 4px; align-items: center; flex: 1; min-width: 0;">
+                                                    <span :style="{color: item.type==='size' ? 'var(--text-muted)' : '#ff6b6b', fontSize: '11px'}">{{ item.type==='size' ? 'w' : 'x' }}</span>
+                                                    <input type="number" step="1" :value="formatNumber(item.type==='size' ? item.value.width : item.value.x)" @change="onUpdateProp(comp.name, prop.key, item.type==='size' ? {width: parseFloat($event.target.value) || 0, height: item.value.height} : {x: parseFloat($event.target.value) || 0, y: item.value.y}, comp.realIndex, idx)" style="flex: 1; min-width: 45px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); border-radius: var(--radius); box-sizing: border-box; padding: 2px 4px; font-size: 11px;" />
+                                                    <span :style="{color: item.type==='size' ? 'var(--text-muted)' : '#69b02a', fontSize: '11px', marginLeft: '4px'}">{{ item.type==='size' ? 'h' : 'y' }}</span>
+                                                    <input type="number" step="1" :value="formatNumber(item.type==='size' ? item.value.height : item.value.y)" @change="onUpdateProp(comp.name, prop.key, item.type==='size' ? {width: item.value.width, height: parseFloat($event.target.value) || 0} : {x: item.value.x, y: parseFloat($event.target.value) || 0}, comp.realIndex, idx)" style="flex: 1; min-width: 45px; background: var(--bg-input); color: var(--text-main); border: 1px solid var(--border-color); border-radius: var(--radius); box-sizing: border-box; padding: 2px 4px; font-size: 11px;" />
+                                                </div>
+                                            </template>
+                                            
+                                            <template v-else-if="item && typeof item === 'object' && item.type === 'color'">
+                                                <div style="display: flex; align-items: center; gap: 4px; min-width: 0;">
+                                                    <input type="color" :value="'#' + item.value.hex.substring(0, 6)" @change="onUpdateProp(comp.name, prop.key, $event.target.value, comp.realIndex, idx)" style="width: 20px; height: 20px; padding: 0; border: none; background: transparent; cursor: pointer;" />
+                                                    <input type="number" step="1" title="Alpha (0-255)" :value="item.value.a" @change="onUpdateProp(comp.name, prop.key, {r: item.value.r, g: item.value.g, b: item.value.b, a: parseInt($event.target.value)||0}, comp.realIndex, idx)" min="0" max="255" style="width: 36px; background: var(--bg-input); color: #ff9800; border: 1px solid var(--border-color); border-radius: var(--radius); box-sizing: border-box; font-weight: bold; font-size: 11px;" />
+                                                </div>
+                                            </template>
+
+                                            <template v-else-if="typeof item === 'number'">
+                                                <input type="number" step="0.1" :value="formatNumber(item)" @change="onUpdateProp(comp.name, prop.key, parseFloat($event.target.value) || 0, comp.realIndex, idx)" style="flex: 1; min-width: 0; background: var(--bg-input); color: #69b02a; border: 1px solid var(--border-color); border-radius: var(--radius); font-size: 11px; padding: 2px 6px;" />
+                                            </template>
+
+                                            <template v-else-if="typeof item === 'boolean'">
+                                                <input type="checkbox" :checked="item" @change="onUpdateProp(comp.name, prop.key, $event.target.checked, comp.realIndex, idx)" style="accent-color: var(--accent-blue);" />
+                                            </template>
+
+                                            <template v-else-if="typeof item === 'string'">
+                                                <textarea :value="item" @change="onUpdateProp(comp.name, prop.key, $event.target.value, comp.realIndex, idx)" rows="1" class="prop-string-textarea array-item-textarea" :title="item"></textarea>
+                                            </template>
+
+                                            <template v-else>
+                                                <input type="text" disabled :value="item" style="flex: 1; min-width: 0; background: var(--bg-input); color: #999; border: 1px solid var(--border-color); border-radius: var(--radius); font-size: 11px; padding: 2px 6px;" :title="item"/>
+                                            </template>
+                                        </div>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </div>
+                </template>
+
+            </div>
+        </div>
+    `,
+    components: {
+        "widget-visualizer": WidgetVisualizer,
+    },
+    setup(props, { emit }) {
+        const expandedComps = ref({});
+        // 默认展开所有组件
+        watch(() => props.nodeDetail, (newVal) => {
+            if (newVal && newVal.components) {
+                newVal.components.forEach((_, idx) => {
+                    if (expandedComps.value[idx] === undefined) {
+                        expandedComps.value[idx] = true;
+                    }
+                });
+            }
+        }, { immediate: true });
+        const toggleComp = (index) => {
+            expandedComps.value[index] = !expandedComps.value[index];
+        };
+        const onUpdateProp = (compName, propKey, value, compIndex, arrayIndex) => {
+            if (!props.nodeDetail)
+                return;
+            let finalValue = value;
+            // 乐观更新 (Optimistic UI Update)
+            if (compName) {
+                const comp = props.nodeDetail.components.find((c) => c.name === compName);
+                if (comp) {
+                    if (propKey === "enabled") {
+                        comp.enabled = finalValue;
+                    }
+                    else {
+                        const prop = comp.properties.find((p) => p.key === propKey);
+                        if (prop) {
+                            if (arrayIndex !== undefined && arrayIndex !== null) {
+                                if (prop.value[arrayIndex] &&
+                                    typeof prop.value[arrayIndex] === "object" &&
+                                    prop.value[arrayIndex].value) {
+                                    if (prop.value[arrayIndex].type === "color" &&
+                                        typeof finalValue === "string" &&
+                                        finalValue.startsWith("#")) {
+                                        const r = parseInt(finalValue.slice(1, 3), 16) || 0;
+                                        const g = parseInt(finalValue.slice(3, 5), 16) || 0;
+                                        const b = parseInt(finalValue.slice(5, 7), 16) || 0;
+                                        finalValue = { r, g, b, a: prop.value[arrayIndex].value.a };
+                                    }
+                                    if (typeof finalValue === "object" && finalValue !== null) {
+                                        Object.assign(prop.value[arrayIndex].value, finalValue);
+                                    }
+                                    else {
+                                        prop.value[arrayIndex].value = finalValue;
+                                    }
+                                }
+                                else {
+                                    prop.value[arrayIndex] = finalValue;
+                                }
+                            }
+                            else {
+                                if (prop.type === "color" &&
+                                    typeof finalValue === "string" &&
+                                    finalValue.startsWith("#")) {
+                                    const r = parseInt(finalValue.slice(1, 3), 16) || 0;
+                                    const g = parseInt(finalValue.slice(3, 5), 16) || 0;
+                                    const b = parseInt(finalValue.slice(5, 7), 16) || 0;
+                                    finalValue = { r, g, b, a: prop.value.a };
+                                }
+                                prop.value = finalValue;
+                            }
+                        }
+                    }
+                }
+            }
+            else {
+                props.nodeDetail[propKey] = finalValue;
+            }
+            emit("update-prop", {
+                uuid: props.nodeDetail.id,
+                compName: compName,
+                propKey: propKey,
+                value: finalValue,
+                compIndex: compIndex,
+                arrayIndex: arrayIndex,
+            });
+        };
+        const onHover = (hovering) => {
+            emit("hover-change", hovering);
+        };
+        const onFocusChange = (focused) => {
+            emit("focus-change", focused);
+        };
+        const formatNumber = (val) => {
+            if (val === undefined || val === null)
+                return 0;
+            const res = parseFloat(val);
+            return isNaN(res) ? 0 : Number(res.toFixed(3)); // 保留 3 位小数避免失真过长
+        };
+        const onLocateNodeRef = (uuid) => {
+            emit("locate-node", uuid);
+        };
+        const onLocateAssetRef = (uuid) => {
+            emit("locate-asset", uuid);
+        };
+        const onPrintComponent = (uuid, compIndex) => {
+            emit("print-comp", uuid, compIndex);
+        };
+        const onPrintNode = () => {
+            if (props.nodeDetail && props.nodeDetail.id) {
+                emit("print-node", props.nodeDetail.id);
+            }
+        };
+        const onExportPsd = () => {
+            if (props.nodeDetail && props.nodeDetail.id) {
+                emit("export-psd", props.nodeDetail.id, props.nodeDetail.name);
+            }
+        };
+        return {
+            expandedComps,
+            toggleComp,
+            onUpdateProp,
+            onHover,
+            onFocusChange,
+            formatNumber,
+            onLocateNodeRef,
+            onLocateAssetRef,
+            onPrintComponent,
+            onPrintNode,
+            onExportPsd,
+        };
+    },
+};
+//# sourceMappingURL=NodeInspector.js.map

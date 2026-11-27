@@ -29,6 +29,8 @@ const { useTabs } = require('./composables/useTabs');
 const { useGameView } = require('./composables/useGameView');
 const { useDevTools } = require('./composables/useDevTools');
 const { useProfiler } = require('./composables/useProfiler');
+const { usePreviewHotkey } = require('./composables/usePreviewHotkey');
+const { useAccountLogin } = require('./composables/useAccountLogin');
 const { useNodeSystem } = require('./composables/useNodeSystem');
 
 module.exports = Editor.Panel.extend({
@@ -196,6 +198,9 @@ module.exports = Editor.Panel.extend({
 
                 const devToolsSystem = useDevTools(globalState, gameView, devtoolsView, activeTab, layoutSystem.rightPanelWidth);
 
+                // --- 预览区空白处按 R 刷新游戏视图（不抢游戏画布内的按键） ---
+                const previewHotkey = usePreviewHotkey(wrapMount, () => gameViewSystem.refreshGame());
+
                 // --- 用户脚本系统 ---
                 const registeredScriptTools: Map<string, any> = new Map();
                 const registerMcpToolFn = (toolDef: any) => {
@@ -216,6 +221,9 @@ module.exports = Editor.Panel.extend({
 
                 _refreshGameFn = gameViewSystem.refreshGame;
                 _gameViewSystem = gameViewSystem;
+                // 账号自动登录：界面在面板 DOM 里，引擎在 webview 的探针里
+                const accountLoginSystem = useAccountLogin(globalState, gameView);
+                accountLoginSystem.accountStartPolling();
 
                 const openScriptEditor = (fileName?: string, content?: string) => {
                     globalState.scriptEditorFileName = fileName || '';
@@ -555,6 +563,7 @@ mcp.log('脚本已加载');
                 onMounted(() => {
                     layoutSystem.setupResizeObserver();
                     gameViewSystem.setupGameViewListeners();
+                    previewHotkey.install();
                     devToolsSystem.setupDevToolsWatchers();
                     profilerSystem.setupProfilerWatchers();
                     if (panelAppElement) {
@@ -1023,7 +1032,8 @@ mcp.log('脚本已加载');
                     ...gameViewSystem,
                     ...devToolsSystem,
                     ...profilerSystem,
-                    ...nodeSystem
+                    ...nodeSystem,
+                    ...accountLoginSystem
                 };
             }
         });

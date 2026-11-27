@@ -1,0 +1,627 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.useNodeSystem = useNodeSystem;
+const { nextTick, onUnmounted, watch } = require('vue');
+function useNodeSystem(globalState, gameView, nodeTreeRef, activeTab) {
+    const syncNodeDetail = (oldObj, newObj) => {
+        if (!oldObj || oldObj.id !== newObj.id)
+            return newObj;
+        for (let key in newObj) {
+            if (key !== 'components')
+                oldObj[key] = newObj[key];
+        }
+        if (oldObj.components && newObj.components && oldObj.components.length === newObj.components.length) {
+            for (let i = 0; i < newObj.components.length; i++) {
+                const oComp = oldObj.components[i];
+                const nComp = newObj.components[i];
+                oComp.enabled = nComp.enabled;
+                oComp.name = nComp.name;
+                if (oComp.properties && nComp.properties) {
+                    const pMap = {};
+                    oComp.properties.forEach((p) => pMap[p.key] = p);
+                    nComp.properties.forEach((np) => {
+                        if (pMap[np.key]) {
+                            pMap[np.key].value = np.value;
+                        }
+                        else {
+                            oComp.properties.push(np);
+                        }
+                    });
+                }
+            }
+        }
+        else {
+            oldObj.components = newObj.components;
+        }
+        return oldObj;
+    };
+    const isWebViewReady = (wv) => {
+        if (!wv)
+            return false;
+        if (typeof wv.isConnected === 'boolean' && !wv.isConnected)
+            return false;
+        try {
+            const id = wv.getWebContentsId();
+            if (!id || id <= 0)
+                return false;
+            return true;
+        }
+        catch (e) {
+            return false;
+        }
+    };
+    const onNodeSelect = (node, isAutoRefresh = false) => {
+        console.log(`[Vue Store Update] onNodeSelect triggered: id=${node ? node.id : 'null'}, autoRefresh=${isAutoRefresh}`);
+        console.log(`[Selection-Debug] Trigger: Panel-onNodeSelect | NodeID: ${node ? node.id : 'null'} | AutoRefresh: ${isAutoRefresh} -> Sending setSelectionTarget to WebView`);
+        const wv = gameView.value;
+        if (isWebViewReady(wv)) {
+            try {
+                const selCode = `if(window.__mcpCrawler && window.__mcpCrawler.setSelectionTarget){ window.__mcpCrawler.setSelectionTarget(${node ? "'" + node.id + "'" : "null"}); }`;
+                wv.executeJavaScript(selCode).catch(() => { });
+            }
+            catch (e) { }
+            if (!node) {
+                if (!isAutoRefresh)
+                    globalState.nodeDetail = null;
+                return;
+            }
+            const code = `window.__mcpCrawler ? JSON.stringify(window.__mcpCrawler.getNodeDetail('${node.id}')) : null`;
+            wv.executeJavaScript(code).then((res) => {
+                if (res) {
+                    const newObj = JSON.parse(res);
+                    const updateState = (finalObj) => {
+                        if (isAutoRefresh && globalState.nodeDetail && globalState.nodeDetail.id === finalObj.id) {
+                            syncNodeDetail(globalState.nodeDetail, finalObj);
+                        }
+                        else {
+                            globalState.nodeDetail = Object.assign({}, finalObj);
+                        }
+                    };
+                    if (!newObj.prefabUuid && typeof Editor !== 'undefined' && Editor.Ipc) {
+                        try {
+                            Editor.Ipc.sendToPanel('scene', 'scene:query-node', node.id, (err, dumpObj) => {
+                                console.log('[Editor Fallback] scene:query-node result for ' + node.id, { err, dumpObj });
+                                if (!err && dumpObj) {
+                                    try {
+                                        const parsedDump = typeof dumpObj === 'string' ? JSON.parse(dumpObj) : dumpObj;
+                                        const v = parsedDump.value || parsedDump;
+                                        // A reliable deep search function to locate the asset uuid within the prefab structure
+                                        const findUuid = (obj, depth = 0) => {
+                                            if (!obj || typeof obj !== 'object' || depth > 6)
+                                                return null;
+                                            // 预制体引用通常存在 asset 节点下，提取其中的 uuid 值 (同时规避提取到当前节点的自身 uuid 或者是 fileId)
+                                            if (obj.uuid && typeof obj.uuid === 'string' && obj.uuid.length > 10 && obj.uuid.indexOf('-') !== -1 && obj.uuid !== node.id) {
+                                                return obj.uuid;
+                                            }
+                                            if (obj._uuid && typeof obj._uuid === 'string' && obj._uuid.length > 10 && obj._uuid.indexOf('-') !== -1 && obj._uuid !== node.id) {
+                                                return obj._uuid;
+                                            }
+                                            // 遍历对象，特别是我们要往 .value, .asset 等深入
+                                            for (let key in obj) {
+                                                if (key === 'fileId' || key === 'root' || key === 'sync')
+                                                    continue; // 跳过不相关的
+                                                const res = findUuid(obj[key], depth + 1);
+                                                if (res)
+                                                    return res;
+                                            }
+                                            return null;
+                                        };
+                                        // Start looking in the prefab property of the node dump
+                                        const prefabDump = v.__prefab__ || (v.prefab && v.prefab.value) || v._prefab;
+                                        if (prefabDump) {
+                                            const foundId = findUuid(prefabDump);
+                                            if (foundId) {
+                                                newObj.prefabUuid = foundId;
+                                                console.log('[Editor Fallback] Successfully located true prefabUuid:', foundId);
+                                            }
+                                            else {
+                                                console.warn('[Editor Fallback] Could not find a valid UUID inside the prefab dump object!', prefabDump);
+                                            }
+                                        }
+                                    }
+                                    catch (e) {
+                                        console.error('[Editor Fallback] Error parsing dump:', e);
+                                    }
+                                }
+                                updateState(newObj);
+                            });
+                        }
+                        catch (e) {
+                            console.error('[Editor Fallback] sendToPanel error:', e);
+                            updateState(newObj);
+                        }
+                    }
+                    else {
+                        updateState(newObj);
+                    }
+                }
+                else {
+                    if (!isAutoRefresh)
+                        globalState.nodeDetail = null;
+                }
+            }).catch(() => {
+                if (!isAutoRefresh)
+                    globalState.nodeDetail = null;
+            });
+        }
+    };
+    const onNodeHover = (node) => {
+        const wv = gameView.value;
+        if (isWebViewReady(wv)) {
+            try {
+                const hoverId = node ? node.id : '';
+                const code = `if(window.__mcpCrawler && window.__mcpCrawler.setHoverTarget){ window.__mcpCrawler.setHoverTarget('${hoverId}'); }`;
+                wv.executeJavaScript(code).catch(() => { });
+            }
+            catch (e) { }
+        }
+    };
+    const onUpdateNodeProp = (payload) => {
+        const wv = gameView.value;
+        if (isWebViewReady(wv)) {
+            const { uuid, compName, propKey, value, compIndex, arrayIndex } = payload;
+            let valStr;
+            if (typeof value === 'string') {
+                valStr = JSON.stringify(value);
+            }
+            else if (typeof value === 'object' && value !== null) {
+                valStr = JSON.stringify(value);
+            }
+            else {
+                valStr = String(value);
+            }
+            const compStr = compName ? '"' + compName + '"' : 'null';
+            const arrIdxStr = arrayIndex !== undefined ? arrayIndex : -1;
+            const code = `
+                if (window.__mcpCrawler && typeof window.__mcpCrawler.updateNodeProperty === 'function') {
+                    window.__mcpCrawler.updateNodeProperty('${uuid}', ${compStr}, '${propKey}', ${valStr}, ${compIndex !== undefined ? compIndex : -1}, ${arrIdxStr});
+                } else {
+                    console.error("[MCP Bridge] 致命错误: window.__mcpCrawler.updateNodeProperty 未就绪或丢失。");
+                }
+            `;
+            const __p1 = wv.executeJavaScript(code);
+            if (__p1 && __p1.catch)
+                __p1.catch(() => { });
+            try {
+                if (!globalState.isEditorSceneActive) {
+                    console.warn('[Bridge] 场景未激活，拦截了向 Editor 的底层 IPC 调用以防报错');
+                    return;
+                }
+                if (typeof Editor !== 'undefined' && Editor.Ipc) {
+                    Editor.Ipc.sendToPanel('scene', 'scene:query-node', uuid, (err, dumpObj) => {
+                        if (err) {
+                            return;
+                        }
+                        try {
+                            const dump = typeof dumpObj === 'string' ? JSON.parse(dumpObj) : dumpObj;
+                            const comps = dump.value.__comps__ || dump.value.components || dump.__comps__ || dump.components || dump;
+                            const fs = require('fs');
+                            const p = require('path').join(__dirname, '../../../memory/dump.json');
+                            fs.writeFileSync(p, JSON.stringify(comps, null, 2));
+                        }
+                        catch (e) { }
+                    });
+                }
+            }
+            catch (e) {
+                console.error('[Bridge Webview Error] Failed to query scene node info:', e);
+            }
+        }
+    };
+    const toggleNodePicker = () => {
+        globalState.isNodePickerActive = !globalState.isNodePickerActive;
+        const wv = gameView.value;
+        if (isWebViewReady(wv)) {
+            const method = globalState.isNodePickerActive ? 'enable' : 'disable';
+            const code = `if(window.__mcpNodePicker) window.__mcpNodePicker.${method}();`;
+            const p = wv.executeJavaScript(code);
+            if (p && p.catch)
+                p.catch(() => { });
+        }
+    };
+    const onRenderDebuggerToggle = (newVal) => {
+        const wv = gameView.value;
+        if (!isWebViewReady(wv))
+            return;
+        wv.executeJavaScript(`
+                var targetWin = window;
+                var frm = document.getElementById('GameDiv');
+                if (frm && frm.contentWindow && frm.contentWindow.__mcpRenderDebuggerHook) {
+                    targetWin = frm.contentWindow;
+                }
+                if (targetWin.__mcpRenderDebuggerHook) {
+                    if (${newVal}) {
+                        targetWin.__mcpRenderDebuggerHook.injectHooks();
+                    } else {
+                        targetWin.__mcpRenderDebuggerHook.restoreHooks();
+                    }
+                }
+            `).catch((err) => console.error("[RenderDebugger] executeJavaScript 抛出异常:", err));
+    };
+    // ===== 补定位状态：树缓存未命中时挂起，等待重同步数据到达后自动重试 =====
+    let pendingLocateUuid = null; // 挂起待补定位的节点 UUID
+    let locateRetryCount = 0; // 当前挂起定位已重试次数
+    const MAX_LOCATE_RETRY = 3; // 重试上限，防止无限循环
+    /**
+     * 定位并展开指定 UUID 的节点（包含自动切换至节点树 Tab 逻辑）
+     * 树缓存未命中时挂起 pendingLocateUuid，待重同步数据到达后由 watch 自动重试补定位
+     * @param uuid 目标节点 UUID
+     */
+    const locateAndExpandNode = (uuid) => {
+        if (!uuid)
+            return;
+        activeTab.value = 0; // 自动切换至节点树 Tab
+        nextTick(() => {
+            const nt = nodeTreeRef.value;
+            // 首次调用的同步异常按未命中处理，避免抛出中断后续挂起/兜底流程导致定位静默失败
+            let success = false;
+            try {
+                success = !!(nt && typeof nt.expandToNode === 'function' && nt.expandToNode(uuid));
+            }
+            catch (err) {
+                console.warn('[Bridge] expandToNode 首次调用异常，转入补定位重试:', err);
+            }
+            if (success) {
+                // 定位成功：清空挂起状态（最新定位覆盖旧挂起）
+                pendingLocateUuid = null;
+                locateRetryCount = 0;
+                return;
+            }
+            console.warn(`[Bridge] 节点树缓存中未找到节点(UUID: ${uuid})，启用属性兜底同步`);
+            // 记录挂起定位（含树组件未挂载场景），后到拾取覆盖旧挂起
+            pendingLocateUuid = uuid;
+            locateRetryCount = 0;
+            onNodeSelect({ id: uuid }, true);
+            try {
+                const syncCode = "if(window.__mcpSyncNodeTree) { window.__mcpSyncNodeTree(); }";
+                const wv = gameView.value;
+                if (wv && typeof wv.executeJavaScript === 'function') {
+                    wv.executeJavaScript(syncCode).catch(() => { });
+                }
+            }
+            catch (err) { }
+        });
+    };
+    /**
+     * 监听节点树重同步完成（update-tree 回流刷新 globalState.lastTreeUpdate），
+     * 若存在挂起的补定位请求则自动重试展开；最多重试 MAX_LOCATE_RETRY 次后可见告警放弃
+     * 注意 1：使用 flush: 'post' 确保重试在组件以新树完成渲染后执行，避免读到旧树
+     * 注意 2：lastTreeUpdate 归零（预览刷新/初始化）只是树失效信号而非新数据到达，
+     *         此时直接忽略且不消耗重试计数，保持挂起定位待刷新后的真实更新继续补定位
+     */
+    watch(() => globalState.lastTreeUpdate, () => {
+        if (!pendingLocateUuid)
+            return;
+        // 树失效信号（预览刷新/初始化归零）：不消耗重试预算，保持挂起定位
+        if (globalState.lastTreeUpdate === 0)
+            return;
+        try {
+            const nt = nodeTreeRef.value;
+            const success = nt && typeof nt.expandToNode === 'function' && nt.expandToNode(pendingLocateUuid);
+            if (success) {
+                pendingLocateUuid = null;
+                locateRetryCount = 0;
+                return;
+            }
+        }
+        catch (err) {
+            console.warn('[Bridge] 补定位重试发生异常:', err);
+        }
+        locateRetryCount++;
+        if (locateRetryCount >= MAX_LOCATE_RETRY) {
+            const msg = `[Bridge] 节点树重同步后仍未找到节点(UUID: ${pendingLocateUuid})，已放弃补定位`;
+            if (typeof Editor !== 'undefined' && Editor.warn)
+                Editor.warn(msg);
+            else
+                console.warn(msg);
+            pendingLocateUuid = null;
+            locateRetryCount = 0;
+        }
+    }, { flush: 'post' });
+    const onRenderDebuggerLocate = (id) => {
+        locateAndExpandNode(id);
+    };
+    let locateResourceTimer = null;
+    const locateResource = (res) => {
+        if (!res || !res.id)
+            return;
+        const uuid = res.id;
+        if (uuid.length < 5 || uuid.startsWith('default-') || uuid.indexOf('preview-') !== -1)
+            return;
+        if (locateResourceTimer)
+            clearTimeout(locateResourceTimer);
+        locateResourceTimer = setTimeout(() => {
+            if (typeof Editor !== 'undefined' && Editor.Ipc) {
+                Editor.Ipc.sendToAll('assets:hint', uuid);
+            }
+        }, 300);
+    };
+    const onLocateNode = (uuid) => {
+        if (nodeTreeRef.value) {
+            const targetId = uuid;
+            const success = nodeTreeRef.value.expandToNode(targetId);
+            if (!success)
+                console.warn(`[Bridge] 树组件未能展开节点：${targetId}`);
+        }
+    };
+    let locateAssetTimeout = null;
+    const onLocateAsset = (uuid) => {
+        if (!uuid)
+            return;
+        if (locateAssetTimeout)
+            clearTimeout(locateAssetTimeout);
+        locateAssetTimeout = setTimeout(() => {
+            try {
+                let targetUuid = uuid;
+                if (uuid.length === 22 || uuid.length === 23) {
+                    if (typeof Editor !== 'undefined' && Editor.Utils && Editor.Utils.UuidUtils && Editor.Utils.UuidUtils.decompressUuid) {
+                        try {
+                            targetUuid = Editor.Utils.UuidUtils.decompressUuid(uuid);
+                        }
+                        catch (err) { }
+                    }
+                    else {
+                        // Fallback pure JS decompression if Editor.Utils is unavailable in this context
+                        try {
+                            const BASE64_KEYS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+                            const values = new Array(123);
+                            for (let i = 0; i < 123; ++i)
+                                values[i] = 0;
+                            for (let i = 0; i < 64; ++i)
+                                values[BASE64_KEYS.charCodeAt(i)] = i;
+                            const HexChars = '0123456789abcdef'.split('');
+                            let str = uuid;
+                            let hexChars = [];
+                            let start = str.length === 23 ? 5 : 2;
+                            for (let i = start; i < str.length; i += 2) {
+                                let lhs = values[str.charCodeAt(i)];
+                                let rhs = values[str.charCodeAt(i + 1)];
+                                hexChars.push(HexChars[lhs >> 2]);
+                                hexChars.push(HexChars[((lhs & 3) << 2) | Math.floor(rhs / 16)]);
+                                hexChars.push(HexChars[rhs & 0xF]);
+                            }
+                            str = str.slice(0, start) + hexChars.join('');
+                            targetUuid = str.slice(0, 8) + '-' + str.slice(8, 12) + '-' + str.slice(12, 16) + '-' + str.slice(16, 20) + '-' + str.slice(20);
+                        }
+                        catch (err) { }
+                    }
+                }
+                if (typeof Editor !== 'undefined' && Editor.Ipc)
+                    Editor.Ipc.sendToAll('assets:hint', targetUuid);
+            }
+            catch (e) {
+                console.warn(`[Bridge] IPC 发送失败: ${e.message}`);
+            }
+        }, 300);
+    };
+    const onPrintComp = (uuid, compIndex) => {
+        const wv = gameView.value;
+        if (isWebViewReady(wv)) {
+            const code = `
+                if (window.__mcpCrawler && typeof window.__mcpCrawler.printComponentData === 'function') {
+                    window.__mcpCrawler.printComponentData('${uuid}', ${compIndex});
+                }
+            `;
+            const __p = wv.executeJavaScript(code);
+            if (__p && __p.catch)
+                __p.catch(() => { });
+        }
+    };
+    const onPrintNode = (uuid) => {
+        const wv = gameView.value;
+        if (isWebViewReady(wv)) {
+            const code = `
+                if (window.__mcpCrawler && typeof window.__mcpCrawler.printNodeData === 'function') {
+                    window.__mcpCrawler.printNodeData('${uuid}');
+                }
+            `;
+            const __p = wv.executeJavaScript(code);
+            if (__p && __p.catch)
+                __p.catch(() => { });
+        }
+    };
+    // 自动刷新逻辑
+    let autoRefreshTimer = null;
+    let autoRefreshPaused = false;
+    const startAutoRefresh = () => {
+        if (autoRefreshTimer)
+            return;
+        autoRefreshTimer = setInterval(() => {
+            if (autoRefreshPaused)
+                return;
+            // 前置拦截：如果在悬停 inspector 面板、未选中节点或者当前选项卡并非游戏视图场景，放弃请求
+            if (globalState.isInspectorHovered)
+                return;
+            if (globalState.isInspectorFocused)
+                return;
+            if (!globalState.nodeDetail || !globalState.nodeDetail.id)
+                return;
+            if (activeTab && activeTab.value !== 0)
+                return;
+            onNodeSelect({ id: globalState.nodeDetail.id }, true);
+        }, 500);
+    };
+    const stopAutoRefresh = () => {
+        if (autoRefreshTimer) {
+            clearInterval(autoRefreshTimer);
+            autoRefreshTimer = null;
+        }
+    };
+    startAutoRefresh();
+    const _onPanelHide = () => { autoRefreshPaused = true; };
+    const _onPanelShow = () => { autoRefreshPaused = false; };
+    window.addEventListener('panel-hide', _onPanelHide);
+    window.addEventListener('panel-show', _onPanelShow);
+    onUnmounted(() => {
+        stopAutoRefresh();
+        window.removeEventListener('panel-hide', _onPanelHide);
+        window.removeEventListener('panel-show', _onPanelShow);
+    });
+    const exportNodeAsPsd = async (uuid, nodeName) => {
+        const wv = gameView.value;
+        if (!isWebViewReady(wv)) {
+            if (typeof Editor !== 'undefined')
+                Editor.warn('[PSD Export] WebView 未就绪');
+            return;
+        }
+        if (typeof Editor !== 'undefined')
+            Editor.log(`[PSD Export] 1. 开始导出节点: ${nodeName} (${uuid})`);
+        // 强行注入最新编译的 probe.js 确保热更新
+        try {
+            const fs = require('fs');
+            const path = require('path');
+            const probePath = path.join(__dirname, '../../probe.js');
+            if (fs.existsSync(probePath)) {
+                const freshProbeCode = fs.readFileSync(probePath, 'utf-8');
+                await wv.executeJavaScript(freshProbeCode);
+            }
+        }
+        catch (injectErr) { }
+        const code = `window.__mcpCrawler ? window.__mcpCrawler.exportNodeAsPsdData('${uuid}') : null`;
+        try {
+            if (typeof Editor !== 'undefined')
+                Editor.log(`[PSD Export] 2. 正在向 WebView 发送脚本抓取节点数据...`);
+            const res = await wv.executeJavaScript(code);
+            if (!res) {
+                if (typeof Editor !== 'undefined')
+                    Editor.warn('[PSD Export] 获取节点栅格化数据失败：WebView 返回空数据');
+                return;
+            }
+            if (typeof Editor !== 'undefined')
+                Editor.log(`[PSD Export] 3. 成功获取 WebView 数据, 字节长度: ${res.length}`);
+            const parsedData = JSON.parse(res);
+            const { width, height, layers } = parsedData;
+            if (!layers || layers.length === 0) {
+                if (typeof Editor !== 'undefined')
+                    Editor.warn('[PSD Export] 没有可以导出的图层（可能图层没有渲染组件或未激活）');
+                return;
+            }
+            if (typeof Editor !== 'undefined')
+                Editor.log(`[PSD Export] 4. 解析图层结构成功: 设计分辨率为 ${width}x${height}, 图层数量: ${layers.length}`);
+            // 1. 异步加载所有图层 Base64 图片
+            const loadImg = (base64Str, name) => {
+                return new Promise((resolve) => {
+                    const img = new Image();
+                    img.onload = () => {
+                        if (typeof Editor !== 'undefined')
+                            Editor.log(`[PSD Export] - 成功加载图片数据: ${name} (尺寸: ${img.width}x${img.height})`);
+                        resolve(img);
+                    };
+                    img.onerror = (e) => {
+                        if (typeof Editor !== 'undefined')
+                            Editor.error(`[PSD Export] - 图片数据加载失败: ${name}`);
+                        resolve(null);
+                    };
+                    img.src = base64Str;
+                });
+            };
+            if (typeof Editor !== 'undefined')
+                Editor.log(`[PSD Export] 5. 正在异步载入所有 Base64 图片资源...`);
+            const loadedLayers = await Promise.all(layers.map(async (layer, idx) => {
+                if (layer.imageBase64) {
+                    const img = await loadImg(layer.imageBase64, `${layer.name || 'Unnamed'}[${idx}]`);
+                    return { ...layer, img };
+                }
+                return { ...layer, img: null };
+            }));
+            // 2. 引入 ag-psd 进行打包装包
+            if (typeof Editor !== 'undefined')
+                Editor.log(`[PSD Export] 6. 正在构建 PSD 树形图层结构...`);
+            const { writePsd } = require('ag-psd');
+            const psdChildren = [];
+            const stack = [psdChildren];
+            let imageCount = 0;
+            let groupCount = 0;
+            for (const item of loadedLayers) {
+                if (item.type === 'group') {
+                    groupCount++;
+                    const groupNode = {
+                        name: item.name,
+                        opened: true,
+                        children: [],
+                        opacity: item.opacity / 255
+                    };
+                    stack[stack.length - 1].push(groupNode);
+                    stack.push(groupNode.children);
+                }
+                else if (item.type === 'group_end') {
+                    stack.pop();
+                }
+                else if (item.type === 'image') {
+                    if (!item.img) {
+                        if (typeof Editor !== 'undefined')
+                            Editor.warn(`[PSD Export] 忽略空图像图层: ${item.name}`);
+                        continue;
+                    }
+                    imageCount++;
+                    const canvas = document.createElement('canvas');
+                    canvas.width = item.width;
+                    canvas.height = item.height;
+                    const ctx = canvas.getContext('2d');
+                    if (ctx) {
+                        ctx.drawImage(item.img, 0, 0, item.width, item.height);
+                    }
+                    if (typeof Editor !== 'undefined') {
+                        Editor.log(`[PSD Export] - 放置图片图层: ${item.name}, left: ${item.left}, top: ${item.top}, width: ${item.width}, height: ${item.height}`);
+                    }
+                    stack[stack.length - 1].push({
+                        name: item.name,
+                        canvas: canvas,
+                        left: item.left,
+                        top: item.top,
+                        opacity: item.opacity / 255
+                    });
+                }
+            }
+            if (typeof Editor !== 'undefined')
+                Editor.log(`[PSD Export] 7. 树形构建完成: 图层组(文件夹)数: ${groupCount}, 图像图层数: ${imageCount}`);
+            const psdConfig = {
+                width: width,
+                height: height,
+                children: psdChildren
+            };
+            if (typeof Editor !== 'undefined')
+                Editor.log(`[PSD Export] 8. 正在通过 ag-psd 序列化为 PSD ArrayBuffer...`);
+            const psdBuffer = writePsd(psdConfig);
+            if (typeof Editor !== 'undefined')
+                Editor.log(`[PSD Export] 9. 序列化成功, Buffer 大小: ${psdBuffer.byteLength} 字节`);
+            // 3. 将 Uint8Array/Buffer 发送给主进程完成系统对话框保存
+            if (typeof Editor !== 'undefined') {
+                const arr = Array.from(new Uint8Array(psdBuffer));
+                Editor.log(`[PSD Export] 10. 正在发送保存指令到主进程...`);
+                Editor.Ipc.sendToMain('mcp-inspector-bridge:psd-save-file', { defaultName: `${nodeName}.psd`, bufferArray: arr }, (err, reply) => {
+                    if (err) {
+                        Editor.error('[PSD Export] 保存文件时主进程报错:', err.message || err);
+                        return;
+                    }
+                    if (reply && reply.success) {
+                        Editor.log(`[PSD Export] 11. PSD 成功保存至: ${reply.filePath}`);
+                    }
+                    else if (reply && reply.canceled) {
+                        Editor.log(`[PSD Export] 用户取消了保存操作`);
+                    }
+                });
+            }
+        }
+        catch (e) {
+            if (typeof Editor !== 'undefined')
+                Editor.error('[PSD Export] 导出异常:', e.stack || e.message || e);
+        }
+    };
+    return {
+        onNodeSelect,
+        onNodeHover,
+        onUpdateNodeProp,
+        toggleNodePicker,
+        onRenderDebuggerToggle,
+        onRenderDebuggerLocate,
+        locateAndExpandNode,
+        locateResource,
+        onLocateNode,
+        onLocateAsset,
+        onPrintComp,
+        onPrintNode,
+        exportNodeAsPsd
+    };
+}
+//# sourceMappingURL=useNodeSystem.js.map

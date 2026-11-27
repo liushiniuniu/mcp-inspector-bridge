@@ -326,10 +326,110 @@ export function useNodeSystem(globalState: any, gameView: any, nodeTreeRef: any,
     };
 
     let locateAssetTimeout: any = null;
-    const onLocateAsset = (uuid: string) => {
+
+    /** 等 IPC 回执：超时没回执就当这条通道没注册（450ms，和 cocos-inspector-hint 一致） */
+    const ipcAsk = (sender: any, args: any[], timeoutMs?: number) => new Promise<any>((resolve) => {
+        let settled = false;
+        const finish = (payload: any) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(payload);
+        };
+        const timer = setTimeout(() => finish({ ack: false }), timeoutMs || 450);
+        try {
+            sender.apply(null, args.concat([(err: any, res: any) => {
+                if (err) finish({ ack: true, ok: false, error: err && err.message ? err.message : String(err) });
+                else finish({ ack: true, ok: true, result: res });
+            }]));
+        } catch (e: any) {
+            finish({ ack: false, error: e && e.message ? e.message : String(e) });
+        }
+    });
+
+    /** 查资源信息（用 type 判断是不是预制体）；查不到返回 null */
+    const queryAssetInfo = async (uuid: string) => {
+        const E: any = typeof Editor !== 'undefined' ? Editor : null;
+        if (!E || !E.Ipc) return null;
+        if (E.Message && typeof E.Message.request === 'function') {
+            try {
+                const info = await E.Message.request('asset-db', 'query-asset-info', uuid);
+                if (info) return info;
+            } catch (e) { /* 落到下面的 2.4 写法 */ }
+        }
+        if (typeof E.Ipc.sendToMain !== 'function') return null;
+        const pkgStyle = await ipcAsk(E.Ipc.sendToMain, ['asset-db', 'query-asset-info', uuid], 700);
+        if (pkgStyle.ack && pkgStyle.ok && pkgStyle.result) return pkgStyle.result;
+        const flat = await ipcAsk(E.Ipc.sendToMain, ['asset-db:query-asset-info', uuid], 700);
+        if (flat.ack && flat.ok && flat.result) return flat.result;
+        return null;
+    };
+
+    /**
+     * 在编辑器里打开资源（预制体会进入预制体编辑模式）。
+     * 通道顺序照 packages/cocos-inspector-hint 实测过的那张表：本项目这套魔改 2.4 没有
+     * Editor.Message / sendToPackage，只能 sendToMain / sendToPanel / sendToAll 逐个试，
+     * 拿到回执即停；auto 最多试 3 条（和油猴脚本那边一致）。
+     */
+    const openAssetInEditor = async (uuid: string, isPrefab: boolean) => {
+        const E: any = typeof Editor !== 'undefined' ? Editor : null;
+        const Ipc = E && E.Ipc;
+        if (!Ipc) return null;
+
+        const channels: Array<{ via: string; run: () => Promise<any> }> = [];
+        if (E.Message && typeof E.Message.request === 'function') {
+            channels.push({
+                via: 'Message.request(asset-db/open-asset)',
+                run: async () => {
+                    await E.Message.request('asset-db', 'open-asset', uuid);
+                    return { ack: true, ok: true };
+                }
+            });
+        }
+        if (typeof Ipc.sendToMain === 'function') {
+            channels.push({ via: 'sendToMain(asset-db/open-asset)', run: () => ipcAsk(Ipc.sendToMain, ['asset-db', 'open-asset', uuid]) });
+        }
+        if (isPrefab && typeof Ipc.sendToPanel === 'function') {
+            channels.push({ via: 'sendToPanel(scene/enter-prefab-edit-mode)', run: () => ipcAsk(Ipc.sendToPanel, ['scene', 'scene:enter-prefab-edit-mode', uuid]) });
+        }
+        if (isPrefab && typeof Ipc.sendToMain === 'function') {
+            channels.push({ via: 'sendToMain(scene/enter-prefab-edit-mode)', run: () => ipcAsk(Ipc.sendToMain, ['scene:enter-prefab-edit-mode', uuid]) });
+        }
+        if (isPrefab && typeof Ipc.sendToAll === 'function') {
+            channels.push({ via: 'sendToAll(scene/enter-prefab-edit-mode)', run: () => ipcAsk(Ipc.sendToAll, ['scene:enter-prefab-edit-mode', uuid], 300) });
+        }
+        if (typeof Ipc.sendToAll === 'function') {
+            channels.push({ via: 'sendToAll(assets/open)', run: () => ipcAsk(Ipc.sendToAll, ['assets:open', uuid], 300) });
+        }
+        if (typeof Ipc.sendToPanel === 'function') {
+            channels.push({ via: 'sendToPanel(assets/open)', run: () => ipcAsk(Ipc.sendToPanel, ['assets', 'assets:open', uuid], 300) });
+        }
+        if (typeof Ipc.sendToMain === 'function') {
+            channels.push({ via: 'sendToMain(assets/open)', run: () => ipcAsk(Ipc.sendToMain, ['assets:open', uuid], 300) });
+        }
+
+        const tried: string[] = [];
+        for (const channel of channels.slice(0, 3)) {
+            tried.push(channel.via);
+            const result = await channel.run();
+            if (result && result.ack) {
+                if (result.ok === false) console.warn(`[Bridge] 打开资源失败（${channel.via}）：${result.error || '未知错误'}`);
+                else console.log(`[Bridge] 已在编辑器中打开资源（${channel.via}）`);
+                return { via: channel.via, result };
+            }
+        }
+        console.warn(`[Bridge] 打开资源没有通道回执，可能未生效：${tried.join(' → ')}`);
+        return null;
+    };
+
+    /**
+     * 定位资源；kind === 'prefab' 时顺便在编辑器里打开预制体（定位并打开）。
+     * 其它资源（组件脚本、shader、纹理）保持只定位，不乱切编辑器视图。
+     */
+    const onLocateAsset = (uuid: string, kind?: string) => {
         if (!uuid) return;
         if (locateAssetTimeout) clearTimeout(locateAssetTimeout);
-        locateAssetTimeout = setTimeout(() => {
+        locateAssetTimeout = setTimeout(async () => {
             try {
                 let targetUuid = uuid;
                 if (uuid.length === 22 || uuid.length === 23) {
@@ -361,6 +461,17 @@ export function useNodeSystem(globalState: any, gameView: any, nodeTreeRef: any,
                     }
                 }
                 if (typeof Editor !== 'undefined' && Editor.Ipc) Editor.Ipc.sendToAll('assets:hint', targetUuid);
+
+                // 预制体：定位之后自动在编辑器里打开（进入预制体编辑模式）
+                if (kind === 'prefab') {
+                    const info = await queryAssetInfo(targetUuid);
+                    const type = info && info.type ? String(info.type) : '';
+                    if (type && !/prefab/i.test(type)) {
+                        console.log(`[Bridge] 该资源类型是 ${type}，只定位不打开：${(info && info.url) || targetUuid}`);
+                        return;
+                    }
+                    await openAssetInEditor(targetUuid, true);
+                }
             } catch (e: any) {
                 console.warn(`[Bridge] IPC 发送失败: ${e.message}`);
             }

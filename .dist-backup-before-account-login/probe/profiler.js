@@ -1,0 +1,962 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.initProfiler = initProfiler;
+// @ts-nocheck
+const engine_helper_1 = require("./engine-helper");
+const mask_diag_1 = require("./mask-diag");
+function initProfiler() {
+    // 尽可能早地安装 getContext 捕获（探针先于引擎执行时，用它拿到引擎自己创建的上下文）
+    installContextCapture();
+    let lastFrames = 0;
+    let lastTime = Date.now();
+    let currentFps = 0;
+    // 维护一个平滑窗口计算毫秒数
+    let accumulatedLogicTime = 0;
+    let accumulatedRenderTime = 0;
+    let logicFrames = 0;
+    let renderFrames = 0;
+    // 新增指标累加器
+    let accumulatedGpuTime = 0;
+    let gpuFrames = 0;
+    let gpuStart = 0;
+    let accumulatedShaderSwitches = 0;
+    let accumulatedTextureBinds = 0;
+    let accumulatedVertices = 0;
+    let accumulatedTriangles = 0;
+    let accumulatedPhysicsTime = 0;
+    let physicsFrames = 0;
+    let physicsStart = 0;
+    let logicStart = 0;
+    let renderStart = 0;
+    // 帧时间环形缓冲区（≈10 秒窗口 @60fps），用于百分位计算
+    const FRAME_TIME_WINDOW = 600;
+    const frameDeltas = [];
+    let lastFrameTime = 0;
+    let isEventsHooked = false;
+    let isWebGLHooked = false;
+    let isPhysicsHooked = false;
+    // WebGL 统计计数器（每帧重置）
+    let frameShaderSwitches = 0;
+    let frameTextureBinds = 0;
+    let frameVertices = 0;
+    let frameTriangles = 0;
+    let frameDrawCalls = 0;
+    // 着色器切换详情记录（count 为累计值，frameCount 为当前统计区间内的次数）
+    const shaderSwitchDetails = new Map();
+    // 纹理绑定详情记录
+    const textureBindDetails = new Map();
+    // 自增 ID 计数器
+    let shaderIdCounter = 0;
+    let textureIdCounter = 0;
+    // WebGL 上下文引用（用于查询信息）
+    let cachedGL = null;
+    // 速率统计（每 500ms 结算一次）
+    let rateShaderPerFrame = 0;
+    let rateShaderPerSec = 0;
+    let rateTexturePerFrame = 0;
+    let rateTexturePerSec = 0;
+    // 资源关联映射：WebGL 纹理对象 -> Cocos 资源信息
+    const textureToAssetMap = new Map();
+    // 着色器关联映射：WebGL Program -> Material/Effect 信息
+    const shaderToAssetMap = new Map();
+    // 名称映射：用于显示
+    const textureNameMap = new Map();
+    const shaderNameMap = new Map();
+    // 构建资源关联映射 - 改进版本
+    function buildAssetMapping() {
+        const ccEng = (0, engine_helper_1.getCcEngine)();
+        if (!ccEng || !ccEng.assetManager || !ccEng.assetManager.assets)
+            return;
+        try {
+            // 遍历所有纹理资源，尝试多种方式获取底层 WebGL 纹理
+            ccEng.assetManager.assets.forEach((asset, uuid) => {
+                if (!asset)
+                    return;
+                const isTexture = asset instanceof ccEng.Texture2D ||
+                    (asset.constructor && asset.constructor.name === 'Texture2D');
+                if (isTexture) {
+                    const name = asset.name || 'Unnamed';
+                    // 深度遍历查找 WebGL 纹理对象
+                    const findWebGLTexture = (obj, depth = 0) => {
+                        if (!obj || depth > 3)
+                            return null;
+                        // 检查是否是 WebGL 纹理对象
+                        if (obj.constructor && obj.constructor.name === 'WebGLTexture') {
+                            return obj;
+                        }
+                        // 检查常见属性
+                        const props = ['_texture', '_webglObj', '_glTexture', '_glID', 'texture', '_impl', 'impl'];
+                        for (const prop of props) {
+                            if (obj[prop]) {
+                                const result = findWebGLTexture(obj[prop], depth + 1);
+                                if (result)
+                                    return result;
+                            }
+                        }
+                        // 检查 gfx 纹理对象的 _glTexture
+                        if (obj._glTexture !== undefined) {
+                            return obj._glTexture;
+                        }
+                        return null;
+                    };
+                    const webglTexture = findWebGLTexture(asset);
+                    if (webglTexture) {
+                        textureToAssetMap.set(webglTexture, {
+                            uuid: uuid,
+                            name: name,
+                            type: 'Texture2D'
+                        });
+                    }
+                    // 也记录到名称映射，用于调试
+                    if (asset._nativeAsset) {
+                        // 有些纹理有原生资源引用
+                        const nativeAsset = asset._nativeAsset;
+                        if (nativeAsset && nativeAsset.__uuid) {
+                            // 记录 UUID 关联
+                        }
+                    }
+                }
+                // 关联 SpriteFrame 的纹理
+                const isSpriteFrame = asset instanceof ccEng.SpriteFrame ||
+                    (asset.constructor && asset.constructor.name === 'SpriteFrame');
+                if (isSpriteFrame) {
+                    const name = asset.name || 'Unnamed';
+                    const tex = asset._texture || (asset.getTexture && asset.getTexture());
+                    if (tex) {
+                        const findWebGLTexture = (obj, depth = 0) => {
+                            if (!obj || depth > 3)
+                                return null;
+                            if (obj.constructor && obj.constructor.name === 'WebGLTexture') {
+                                return obj;
+                            }
+                            const props = ['_texture', '_webglObj', '_glTexture', '_glID', 'texture', '_impl', 'impl'];
+                            for (const prop of props) {
+                                if (obj[prop]) {
+                                    const result = findWebGLTexture(obj[prop], depth + 1);
+                                    if (result)
+                                        return result;
+                                }
+                            }
+                            return null;
+                        };
+                        const webglTexture = findWebGLTexture(tex);
+                        if (webglTexture) {
+                            textureToAssetMap.set(webglTexture, {
+                                uuid: uuid,
+                                name: name,
+                                type: 'SpriteFrame'
+                            });
+                        }
+                    }
+                }
+                // 关联材质/Effect（着色器来源）
+                const isMaterial = asset instanceof ccEng.Material ||
+                    (asset.constructor && asset.constructor.name === 'Material');
+                const isEffectAsset = asset instanceof ccEng.EffectAsset ||
+                    (asset.constructor && asset.constructor.name === 'EffectAsset');
+                if (isMaterial || isEffectAsset) {
+                    const name = asset.name || 'Unnamed';
+                    const type = isMaterial ? 'Material' : 'EffectAsset';
+                    try {
+                        // EffectAsset/Material 的结构：techniques -> passes -> program
+                        const effect = isMaterial ? (asset._effect || asset.effect) : asset;
+                        if (effect) {
+                            const techniques = effect._techniques || effect.techniques;
+                            if (techniques && Array.isArray(techniques)) {
+                                for (const technique of techniques) {
+                                    const passes = technique.passes || technique._passes;
+                                    if (passes && Array.isArray(passes)) {
+                                        for (const pass of passes) {
+                                            // pass 有 _programKey 标识着色器程序
+                                            const programKey = pass._programKey || pass.programKey;
+                                            if (programKey !== undefined && programKey !== null) {
+                                                shaderToAssetMap.set(programKey, {
+                                                    uuid: uuid,
+                                                    name: name,
+                                                    type: type
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch (e) {
+                        // 静默失败
+                    }
+                }
+            });
+            if (window.__MCP_DEBUG__) {
+                console.log('[Profiler] Asset mapping built:', {
+                    textures: textureToAssetMap.size,
+                    shaders: shaderToAssetMap.size
+                });
+            }
+        }
+        catch (e) {
+            if (window.__MCP_DEBUG__) {
+                console.warn('[Profiler] buildAssetMapping error:', e);
+            }
+        }
+    }
+    // 每 5 秒更新一次资源映射
+    setInterval(buildAssetMapping, 5000);
+    // 立即构建一次
+    setTimeout(buildAssetMapping, 1000);
+    // ===== WebGL 上下文获取策略：只复用引擎已创建的上下文，绝不主动创建 =====
+    // 背景：canvas.getContext 的上下文属性只在“第一次创建”时生效。若探针抢在引擎之前
+    // 用默认属性调用 getContext('webgl')，默认 stencil 为 false，引擎随后带
+    // { stencil: true } 拿到的仍是这份无模板缓冲的上下文（属性被忽略），
+    // 依赖模板测试的 cc.Mask 就会失效（子节点被整体裁掉 / 露出白色底）。
+    let glHookTarget = null;
+    let glHookBackup = null;
+    let glHooksDisabled = false;
+    let noContextWarned = false;
+    const probeStartTime = Date.now();
+    function installContextCapture() {
+        if (window.__mcpContextCaptureHooked)
+            return;
+        window.__mcpContextCaptureHooked = true;
+        try {
+            const proto = HTMLCanvasElement.prototype;
+            const originalGetContext = proto.getContext;
+            proto.getContext = function (type, attrs) {
+                const ctx = originalGetContext.apply(this, arguments);
+                try {
+                    if (ctx && (type === 'webgl' || type === 'webgl2' || type === 'experimental-webgl')) {
+                        const ccEng = (0, engine_helper_1.getCcEngine)();
+                        const engineGL = ccEng && ccEng.game ? ccEng.game._renderContext : null;
+                        const isGameCanvas = this.id === 'GameCanvas' ||
+                            (ccEng && ccEng.game && ccEng.game.canvas === this);
+                        // 只记录落在游戏画布上的上下文，避免误拿离屏/特效画布的上下文
+                        if (isGameCanvas || !window.__mcpGLContext) {
+                            window.__mcpGLContext = ctx;
+                            window.__mcpGLContextInfo = {
+                                type: type,
+                                attrs: attrs || null,
+                                actual: typeof ctx.getContextAttributes === 'function' ? ctx.getContextAttributes() : null,
+                                canvasId: this.id || '',
+                                canvasSize: this.width + 'x' + this.height,
+                                createdAt: Date.now(),
+                                engineContextAssignedAtCapture: !!(engineGL && engineGL === ctx),
+                                isGameCanvas: !!isGameCanvas,
+                            };
+                        }
+                        if (typeof window.__mcpOnGLContextReady === 'function') {
+                            try {
+                                window.__mcpOnGLContextReady(ctx);
+                            }
+                            catch (e) { }
+                        }
+                    }
+                }
+                catch (e) { }
+                return ctx;
+            };
+        }
+        catch (e) { }
+    }
+    function resolveExistingGL() {
+        // 1) Cocos 2.4 引擎自己缓存的上下文（最可靠：属性一定是引擎申请的那一份）
+        try {
+            const ccEng = (0, engine_helper_1.getCcEngine)();
+            if (ccEng && ccEng.game && ccEng.game._renderContext) {
+                return { gl: ccEng.game._renderContext, source: 'cc.game._renderContext' };
+            }
+        }
+        catch (e) { }
+        // 2) 引擎调用 getContext 时被捕获的上下文（探针先于引擎执行的场景）
+        if (window.__mcpGLContext) {
+            return { gl: window.__mcpGLContext, source: 'getContext-capture' };
+        }
+        // 3) 绝不 fallback 到 canvas.getContext()：宁可暂不统计，也不能抢跑创建上下文
+        return null;
+    }
+    function installGLHooks(gl) {
+        const backup = {};
+        // Hook useProgram - Shader 切换
+        backup.useProgram = gl.useProgram;
+        const originalUseProgram = gl.useProgram.bind(gl);
+        gl.useProgram = function (program) {
+            frameShaderSwitches++;
+            if (program) {
+                let info = shaderSwitchDetails.get(program);
+                if (!info) {
+                    info = { count: 0, lastUsed: 0, id: ++shaderIdCounter, frameCount: 0, perFrame: 0, perSec: 0 };
+                    shaderSwitchDetails.set(program, info);
+                    // 尝试从 Cocos 渲染管线获取当前材质信息
+                    try {
+                        const ccEng = (0, engine_helper_1.getCcEngine)();
+                        if (ccEng && ccEng.renderer) {
+                            // Cocos 2.4 renderer 可能有 _currentMaterial 或类似属性
+                            const mat = ccEng.renderer._material ||
+                                ccEng.renderer._currentMaterial ||
+                                (ccEng.director && ccEng.director._scene);
+                            if (mat && mat._effect) {
+                                // 尝试关联
+                            }
+                        }
+                    }
+                    catch (e) { }
+                }
+                info.count++;
+                info.frameCount++;
+                info.lastUsed = Date.now();
+            }
+            return originalUseProgram(program);
+        };
+        // Hook createTexture - 追踪纹理创建
+        backup.createTexture = gl.createTexture;
+        const originalCreateTexture = gl.createTexture.bind(gl);
+        gl.createTexture = function () {
+            const texture = originalCreateTexture();
+            if (texture) {
+                // 记录创建的纹理，用于后续关联
+                if (!texture.__mcpId) {
+                    texture.__mcpId = ++textureIdCounter;
+                }
+            }
+            return texture;
+        };
+        // Hook texImage2D - 纹理上传时建立资源关联
+        backup.texImage2D = gl.texImage2D;
+        const originalTexImage2D = gl.texImage2D.bind(gl);
+        gl.texImage2D = function (...args) {
+            // 当前绑定的纹理
+            const currentTexture = gl.getParameter(gl.TEXTURE_BINDING_2D);
+            if (currentTexture && !textureToAssetMap.has(currentTexture)) {
+                // 尝试从调用栈或参数推断资源来源
+                // 对于 Cocos，纹理数据通常来自 Image/Canvas/Video 元素
+                const source = args[5] || args[6]; // pixels 参数
+                if (source) {
+                    // 记录来源信息
+                    const sourceInfo = {
+                        uuid: '',
+                        name: source.__assetName || source.src || 'Unknown',
+                        type: source.constructor ? source.constructor.name : 'Unknown'
+                    };
+                    // 尝试关联到最近创建的资源
+                    // 这里可以添加更精确的关联逻辑
+                }
+            }
+            return originalTexImage2D.apply(gl, args);
+        };
+        // Hook bindTexture - 纹理绑定
+        backup.bindTexture = gl.bindTexture;
+        const originalBindTexture = gl.bindTexture.bind(gl);
+        gl.bindTexture = function (target, texture) {
+            if (texture) {
+                frameTextureBinds++;
+                // 确保纹理有 ID
+                if (!texture.__mcpId) {
+                    texture.__mcpId = ++textureIdCounter;
+                }
+                let info = textureBindDetails.get(texture);
+                if (!info) {
+                    info = { count: 0, lastUsed: 0, size: '', id: texture.__mcpId, frameCount: 0, perFrame: 0, perSec: 0 };
+                    textureBindDetails.set(texture, info);
+                    // 调试：记录新纹理对象
+                    if (window.__MCP_DEBUG__) {
+                        const isMapped = textureToAssetMap.has(texture);
+                        console.log(`[Profiler] New texture bound: #${info.id}, mapped=${isMapped}`);
+                    }
+                }
+                info.count++;
+                info.frameCount++;
+                info.lastUsed = Date.now();
+                // 尝试获取纹理尺寸（WebGL1 没有 getTexLevelParameter，会直接抛错并被忽略）
+                try {
+                    const level = 0;
+                    const width = gl.getTexLevelParameter(target, level, gl.TEXTURE_WIDTH);
+                    const height = gl.getTexLevelParameter(target, level, gl.TEXTURE_HEIGHT);
+                    if (width && height)
+                        info.size = `${width}x${height}`;
+                }
+                catch (e) { }
+            }
+            return originalBindTexture(target, texture);
+        };
+        // Hook drawArrays - 统计顶点和三角形
+        backup.drawArrays = gl.drawArrays;
+        const originalDrawArrays = gl.drawArrays.bind(gl);
+        gl.drawArrays = function (mode, first, count) {
+            frameDrawCalls++;
+            frameVertices += count;
+            if (mode === gl.TRIANGLES)
+                frameTriangles += count / 3;
+            else if (mode === gl.TRIANGLE_STRIP || mode === gl.TRIANGLE_FAN)
+                frameTriangles += Math.max(0, count - 2);
+            return originalDrawArrays(mode, first, count);
+        };
+        // Hook drawElements - 统计顶点和三角形
+        backup.drawElements = gl.drawElements;
+        const originalDrawElements = gl.drawElements.bind(gl);
+        gl.drawElements = function (mode, count, type, offset) {
+            frameDrawCalls++;
+            frameVertices += count;
+            if (mode === gl.TRIANGLES)
+                frameTriangles += count / 3;
+            else if (mode === gl.TRIANGLE_STRIP || mode === gl.TRIANGLE_FAN)
+                frameTriangles += Math.max(0, count - 2);
+            return originalDrawElements(mode, count, type, offset);
+        };
+        glHookBackup = backup;
+        glHookTarget = gl;
+    }
+    function tryHookWebGL() {
+        if (isWebGLHooked || glHooksDisabled)
+            return;
+        const resolved = resolveExistingGL();
+        if (!resolved) {
+            if (!noContextWarned && Date.now() - probeStartTime > 5000) {
+                noContextWarned = true;
+                if (window.__MCP_DEBUG__) {
+                    console.log('[Profiler] 暂未获取到引擎 WebGL 上下文，性能统计等待引擎初始化（探针不会主动创建上下文，以免破坏 cc.Mask 的模板缓冲）');
+                }
+            }
+            return;
+        }
+        isWebGLHooked = true;
+        cachedGL = resolved.gl;
+        window.__mcpGLContextSource = resolved.source;
+        installGLHooks(resolved.gl);
+        // 遮罩诊断：只读旁路记录 stencil 调用，用于定位 Mask 异常
+        try {
+            (0, mask_diag_1.installMaskDiagnostics)(resolved.gl);
+        }
+        catch (e) { }
+        const ctxAttrs = (() => {
+            try {
+                return resolved.gl.getContextAttributes ? resolved.gl.getContextAttributes() : null;
+            }
+            catch (e) {
+                return null;
+            }
+        })();
+        if (window.__MCP_DEBUG__) {
+            console.log(`[Profiler] WebGL Hook 已挂载 | 上下文来源: ${resolved.source} | stencil=${ctxAttrs ? ctxAttrs.stencil : '?'} | alpha=${ctxAttrs ? ctxAttrs.alpha : '?'} | premultipliedAlpha=${ctxAttrs ? ctxAttrs.premultipliedAlpha : '?'}`);
+        }
+        window.__mcpGLHookStatus = function () {
+            return {
+                hooked: !!glHookTarget && !glHooksDisabled,
+                disabledByUser: glHooksDisabled,
+                contextSource: resolved.source,
+                contextIsEngineContext: (() => {
+                    try {
+                        const cc = (0, engine_helper_1.getCcEngine)();
+                        return !!(cc && cc.game && cc.game._renderContext === resolved.gl);
+                    }
+                    catch (e) {
+                        return false;
+                    }
+                })(),
+                contextInfo: window.__mcpGLContextInfo || null,
+                contextAttributes: ctxAttrs,
+                stencilBits: (() => { try {
+                    return resolved.gl.getParameter(resolved.gl.STENCIL_BITS);
+                }
+                catch (e) {
+                    return null;
+                } })(),
+            };
+        };
+        // A/B 排查开关：还原全部 WebGL Hook，用于确认遮罩问题是否由本插件的 GL 包装引起
+        window.__mcpDisableGLHooks = function () {
+            if (!glHookTarget || !glHookBackup) {
+                console.warn('[Profiler] 当前没有可还原的 WebGL Hook');
+                return false;
+            }
+            Object.keys(glHookBackup).forEach((name) => {
+                try {
+                    glHookTarget[name] = glHookBackup[name];
+                }
+                catch (e) { }
+            });
+            try {
+                (0, mask_diag_1.restoreMaskDiagnostics)();
+            }
+            catch (e) { }
+            glHooksDisabled = true;
+            isWebGLHooked = true; // 阻止 500ms 轮询重新挂载
+            console.warn('[Profiler] 已还原全部 WebGL Hook（A/B 排查模式）。若此时遮罩立即恢复，说明问题出在 WebGL 包装层；刷新页面即可恢复性能统计。');
+            return true;
+        };
+    }
+    function tryHookDirectorEvents() {
+        if (isEventsHooked)
+            return;
+        const ccEng = (0, engine_helper_1.getCcEngine)();
+        if (!ccEng || !ccEng.director)
+            return;
+        isEventsHooked = true;
+        lastFrames = ccEng.director.getTotalFrames ? ccEng.director.getTotalFrames() : 0;
+        // 实时逻辑消耗窃听器
+        ccEng.director.on(ccEng.Director.EVENT_BEFORE_UPDATE, () => {
+            logicStart = performance.now();
+            // 记录帧间间隔
+            if (lastFrameTime > 0) {
+                const delta = logicStart - lastFrameTime;
+                frameDeltas.push(delta);
+                if (frameDeltas.length > FRAME_TIME_WINDOW)
+                    frameDeltas.shift();
+            }
+            lastFrameTime = logicStart;
+        });
+        ccEng.director.on(ccEng.Director.EVENT_AFTER_UPDATE, () => {
+            accumulatedLogicTime += (performance.now() - logicStart);
+            logicFrames++;
+        });
+        // 实时渲染消耗窃听器
+        ccEng.director.on(ccEng.Director.EVENT_BEFORE_DRAW, () => {
+            renderStart = performance.now();
+            // 每帧开始时重置 WebGL 统计
+            frameShaderSwitches = 0;
+            frameTextureBinds = 0;
+            frameVertices = 0;
+            frameTriangles = 0;
+            frameDrawCalls = 0;
+        });
+        ccEng.director.on(ccEng.Director.EVENT_AFTER_DRAW, () => {
+            accumulatedRenderTime += (performance.now() - renderStart);
+            renderFrames++;
+            // 累加 WebGL 统计
+            accumulatedShaderSwitches += frameShaderSwitches;
+            accumulatedTextureBinds += frameTextureBinds;
+            accumulatedVertices += frameVertices;
+            accumulatedTriangles += frameTriangles;
+        });
+        // 物理步进耗时窃听器
+        if (ccEng.PhysicsManager && ccEng.PhysicsManager.instance) {
+            const pm = ccEng.PhysicsManager.instance;
+            const originalStep = pm.step;
+            pm.step = function (dt) {
+                physicsStart = performance.now();
+                const result = originalStep.apply(this, arguments);
+                accumulatedPhysicsTime += (performance.now() - physicsStart);
+                physicsFrames++;
+                return result;
+            };
+            isPhysicsHooked = true;
+        }
+    }
+    tryHookDirectorEvents();
+    tryHookWebGL();
+    // 缓存给主进程轮询拿的变量
+    let displayLogicTime = 0;
+    let displayRenderTime = 0;
+    let displayGpuTime = 0;
+    let displayShaderSwitches = 0;
+    let displayTextureBinds = 0;
+    let displayVertices = 0;
+    let displayTriangles = 0;
+    let displayPhysicsTime = 0;
+    let displayJsHeapUsed = 0;
+    let displayJsHeapTotal = 0;
+    setInterval(() => {
+        tryHookDirectorEvents();
+        tryHookWebGL();
+        const ccEng = (0, engine_helper_1.getCcEngine)();
+        if (!ccEng || !ccEng.director)
+            return;
+        const now = Date.now();
+        const frames = ccEng.director.getTotalFrames ? ccEng.director.getTotalFrames() : 0;
+        const dt = (now - lastTime) / 1000;
+        if (dt > 0) {
+            currentFps = Math.max(0, Math.round((frames - lastFrames) / dt));
+        }
+        lastTime = now;
+        lastFrames = frames;
+        // 平滑计算平均耗时，保留 2 位小数
+        displayLogicTime = logicFrames > 0 ? Number((accumulatedLogicTime / logicFrames).toFixed(2)) : 0;
+        displayRenderTime = renderFrames > 0 ? Number((accumulatedRenderTime / renderFrames).toFixed(2)) : 0;
+        displayGpuTime = gpuFrames > 0 ? Number((accumulatedGpuTime / gpuFrames).toFixed(2)) : 0;
+        displayVertices = Math.round(accumulatedVertices / Math.max(renderFrames, 1));
+        displayTriangles = Math.round(accumulatedTriangles / Math.max(renderFrames, 1));
+        displayPhysicsTime = physicsFrames > 0 ? Number((accumulatedPhysicsTime / physicsFrames).toFixed(2)) : 0;
+        // 结算着色器/纹理速率（每帧 + 每秒），并清零区间计数
+        const framesInWindow = Math.max(renderFrames, 1);
+        const elapsedSec = dt > 0 ? dt : 0.5;
+        rateShaderPerFrame = Number((accumulatedShaderSwitches / framesInWindow).toFixed(1));
+        rateShaderPerSec = Math.round(accumulatedShaderSwitches / elapsedSec);
+        rateTexturePerFrame = Number((accumulatedTextureBinds / framesInWindow).toFixed(1));
+        rateTexturePerSec = Math.round(accumulatedTextureBinds / elapsedSec);
+        // 叠加框也展示每帧次数，与详情面板口径一致
+        displayShaderSwitches = rateShaderPerFrame;
+        displayTextureBinds = rateTexturePerFrame;
+        shaderSwitchDetails.forEach((info) => {
+            info.perFrame = Number((info.frameCount / framesInWindow).toFixed(2));
+            info.perSec = Math.round(info.frameCount / elapsedSec);
+            info.frameCount = 0;
+        });
+        textureBindDetails.forEach((info) => {
+            info.perFrame = Number((info.frameCount / framesInWindow).toFixed(2));
+            info.perSec = Math.round(info.frameCount / elapsedSec);
+            info.frameCount = 0;
+        });
+        // JS Heap 内存 - 尝试多种方式
+        if (typeof performance !== 'undefined') {
+            // 方式1: performance.memory (Chrome/Electron)
+            if (performance.memory) {
+                displayJsHeapUsed = Math.round(performance.memory.usedJSHeapSize / 1024 / 1024 * 100) / 100;
+                displayJsHeapTotal = Math.round(performance.memory.totalJSHeapSize / 1024 / 1024 * 100) / 100;
+            }
+            // 方式2: performance.measureUserAgentSpecificMemory (需要 await，异步)
+            // 方式3: process.memoryUsage (Node.js/Electron renderer)
+            else if (typeof process !== 'undefined' && process.memoryUsage) {
+                try {
+                    const mem = process.memoryUsage();
+                    displayJsHeapUsed = Math.round(mem.heapUsed / 1024 / 1024 * 100) / 100;
+                    displayJsHeapTotal = Math.round(mem.heapTotal / 1024 / 1024 * 100) / 100;
+                }
+                catch (e) { }
+            }
+        }
+        // 重置累加器
+        accumulatedLogicTime = 0;
+        logicFrames = 0;
+        accumulatedRenderTime = 0;
+        renderFrames = 0;
+        accumulatedGpuTime = 0;
+        gpuFrames = 0;
+        accumulatedShaderSwitches = 0;
+        accumulatedTextureBinds = 0;
+        accumulatedVertices = 0;
+        accumulatedTriangles = 0;
+        accumulatedPhysicsTime = 0;
+        physicsFrames = 0;
+    }, 500); // 也是 500ms，和 FPS 一起刷新平滑
+    window.__mcpProfilerTick = function () {
+        // 读取 DrawCall: 优先从 WebGL hook 获取，回退到 renderer
+        let drawCall = frameDrawCalls;
+        const ccEng = (0, engine_helper_1.getCcEngine)();
+        try {
+            if (drawCall === 0 && ccEng && ccEng.renderer && typeof ccEng.renderer.drawCalls !== 'undefined') {
+                drawCall = ccEng.renderer.drawCalls;
+            }
+        }
+        catch (e) { }
+        // 计算帧率分位统计
+        let avgFps = 0, fps1pLow = 0, fps01pLow = 0;
+        if (frameDeltas.length > 30) {
+            const sorted = [...frameDeltas].sort((a, b) => a - b);
+            const avg = sorted.reduce((s, v) => s + v, 0) / sorted.length;
+            avgFps = Math.round(1000 / avg * 10) / 10;
+            const idx99 = Math.min(Math.ceil(sorted.length * 0.99) - 1, sorted.length - 1);
+            const idx999 = Math.min(Math.ceil(sorted.length * 0.999) - 1, sorted.length - 1);
+            fps1pLow = Math.round(1000 / Math.max(sorted[idx99], 0.1));
+            fps01pLow = Math.round(1000 / Math.max(sorted[idx999], 0.1));
+        }
+        return {
+            fps: currentFps,
+            avgFps: avgFps,
+            fps1pLow: fps1pLow,
+            fps01pLow: fps01pLow,
+            drawCall: drawCall,
+            logicTime: displayLogicTime,
+            renderTime: displayRenderTime,
+            gpuTime: displayGpuTime,
+            shaderSwitches: displayShaderSwitches,
+            textureBinds: displayTextureBinds,
+            vertices: displayVertices,
+            triangles: displayTriangles,
+            physicsTime: displayPhysicsTime,
+            jsHeapUsed: displayJsHeapUsed,
+            jsHeapTotal: displayJsHeapTotal
+        };
+    };
+    window.__mcpCountNodes = function () {
+        const ccEng = (0, engine_helper_1.getCcEngine)();
+        const scene = ccEng ? ccEng.director.getScene() : null;
+        if (!scene)
+            return 0;
+        function count(node) {
+            let n = 1;
+            if (node.children) {
+                for (let i = 0; i < node.children.length; i++) {
+                    n += count(node.children[i]);
+                }
+            }
+            return n;
+        }
+        return count(scene);
+    };
+    // 着色器与纹理绑定详情接口
+    window.__mcpGetShaderTextureDetails = function () {
+        // 统计匹配情况
+        let matchedCount = 0;
+        let totalCount = 0;
+        // 转换 Map 为数组，按调用次数排序
+        const shaders = Array.from(shaderSwitchDetails.entries())
+            .map(([program, info]) => {
+            totalCount++;
+            // 获取关联的资源信息
+            const assetInfo = shaderToAssetMap.get(program);
+            let name = `Shader #${info.id}`;
+            let assetUuid = '';
+            let assetName = '';
+            let assetType = '';
+            if (assetInfo) {
+                matchedCount++;
+                assetUuid = assetInfo.uuid;
+                assetName = assetInfo.name;
+                assetType = assetInfo.type;
+                name = `${assetInfo.name}`;
+            }
+            else {
+                // 尝试从着色器源码中提取名称标识
+                try {
+                    if (cachedGL && program) {
+                        const attachedShaders = cachedGL.getAttachedShaders(program);
+                        if (attachedShaders && attachedShaders.length > 0) {
+                            const source = cachedGL.getShaderSource(attachedShaders[0]);
+                            if (source) {
+                                // 尝试提取 #define NAME 或注释中的名称
+                                let shaderName = '';
+                                // 查找 #define 定义（如 #define USE_TEXTURE）
+                                const defineMatch = source.match(/#define\s+(\w+)/);
+                                if (defineMatch) {
+                                    shaderName = defineMatch[1];
+                                }
+                                // 查找顶点/片元标识
+                                if (!shaderName) {
+                                    if (source.indexOf('gl_Position') !== -1) {
+                                        shaderName = 'Vertex';
+                                    }
+                                    else if (source.indexOf('gl_FragColor') !== -1 || source.indexOf('gl_FragData') !== -1) {
+                                        shaderName = 'Fragment';
+                                    }
+                                }
+                                // 查找 precision 声明判断类型
+                                if (!shaderName) {
+                                    if (source.indexOf('attribute') !== -1) {
+                                        shaderName = 'Vertex';
+                                    }
+                                    else if (source.indexOf('varying') !== -1 && source.indexOf('uniform') !== -1) {
+                                        shaderName = 'Fragment';
+                                    }
+                                }
+                                // 最终显示
+                                if (shaderName) {
+                                    name = `${shaderName} Shader #${info.id}`;
+                                }
+                                else {
+                                    name = `Shader #${info.id}`;
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (e) { }
+            }
+            return {
+                id: name,
+                rawId: info.id,
+                count: info.count,
+                perFrame: info.perFrame,
+                perSec: info.perSec,
+                lastUsed: info.lastUsed,
+                assetUuid: assetUuid,
+                assetName: assetName,
+                assetType: assetType
+            };
+        })
+            .sort((a, b) => (b.perSec - a.perSec) || (b.count - a.count))
+            .slice(0, 50);
+        const textures = Array.from(textureBindDetails.entries())
+            .map(([texture, info]) => {
+            totalCount++;
+            // 获取关联的资源信息
+            const assetInfo = textureToAssetMap.get(texture);
+            let name = `Texture #${info.id}`;
+            let assetUuid = '';
+            let assetName = '';
+            let assetType = '';
+            if (assetInfo) {
+                matchedCount++;
+                assetUuid = assetInfo.uuid;
+                assetName = assetInfo.name;
+                assetType = assetInfo.type;
+                name = assetInfo.name;
+            }
+            return {
+                id: name,
+                rawId: info.id,
+                count: info.count,
+                perFrame: info.perFrame,
+                perSec: info.perSec,
+                size: info.size,
+                lastUsed: info.lastUsed,
+                assetUuid: assetUuid,
+                assetName: assetName,
+                assetType: assetType
+            };
+        })
+            .sort((a, b) => (b.perSec - a.perSec) || (b.count - a.count))
+            .slice(0, 50);
+        // 调试输出匹配统计
+        if (window.__MCP_DEBUG__) {
+            console.log(`[Profiler] ShaderTextureDetails: matched=${matchedCount}/${totalCount}, textureMap=${textureToAssetMap.size}, shaderMap=${shaderToAssetMap.size}`);
+        }
+        return {
+            shaderCount: shaderSwitchDetails.size,
+            textureCount: textureBindDetails.size,
+            shaders,
+            textures,
+            summary: {
+                // 实时速率（每帧 / 每秒）
+                shaderPerFrame: rateShaderPerFrame,
+                shaderPerSec: rateShaderPerSec,
+                texturePerFrame: rateTexturePerFrame,
+                texturePerSec: rateTexturePerSec
+            }
+        };
+    };
+    // 清空详情记录
+    window.__mcpClearShaderTextureDetails = function () {
+        shaderSwitchDetails.clear();
+        textureBindDetails.clear();
+        return { success: true };
+    };
+    // 帧时间历史数据接口：用于绘制帧时间波形图
+    window.__mcpGetFrameTimeline = function () {
+        // 返回最近的帧时间数组（ms）以及对应的统计信息
+        return {
+            frameTimes: [...frameDeltas],
+            capacity: FRAME_TIME_WINDOW
+        };
+    };
+    // ============ 内存时间轴与泄漏检测 ============
+    // 内存历史环形缓冲区（≈5 分钟 @2s 采样一次 = 150 样本）
+    const MEMORY_HISTORY_CAPACITY = 150;
+    const memoryHistory = [];
+    // 泄漏检测基线：连续采样对比
+    let leakDetectionBaseline = null;
+    let leakDetectionSamples = [];
+    const LEAK_DETECTION_WINDOW = 30; // 30 个样本用于趋势分析
+    // 采样内存数据
+    function sampleMemory() {
+        const now = Date.now();
+        let jsHeapUsed = 0;
+        let jsHeapTotal = 0;
+        if (typeof performance !== 'undefined' && performance.memory) {
+            jsHeapUsed = performance.memory.usedJSHeapSize;
+            jsHeapTotal = performance.memory.totalJSHeapSize;
+        }
+        else if (typeof process !== 'undefined' && process.memoryUsage) {
+            try {
+                const mem = process.memoryUsage();
+                jsHeapUsed = mem.heapUsed;
+                jsHeapTotal = mem.heapTotal;
+            }
+            catch (e) { }
+        }
+        // 获取资源内存总量
+        let totalMemory = 0;
+        try {
+            const ccEng = (0, engine_helper_1.getCcEngine)();
+            // 优先复用内存排行的完整统计（与「资源内存排行」面板同源，避免口径不一致）
+            if (typeof window.__mcpGetMemoryRanking === 'function') {
+                const ranking = window.__mcpGetMemoryRanking();
+                if (ranking && typeof ranking.totalMemory === 'number') {
+                    totalMemory = ranking.totalMemory;
+                }
+            }
+            // 兜底：粗略累加原生资源字节数
+            if (totalMemory === 0 && ccEng && ccEng.assetManager && ccEng.assetManager.assets) {
+                ccEng.assetManager.assets.forEach((asset, uuid) => {
+                    if (!asset)
+                        return;
+                    if (asset._nativeAsset && asset._nativeAsset.byteLength) {
+                        totalMemory += asset._nativeAsset.byteLength;
+                    }
+                });
+            }
+        }
+        catch (e) { }
+        const sample = {
+            time: now,
+            jsHeapUsed: jsHeapUsed,
+            jsHeapTotal: jsHeapTotal,
+            totalMemory: totalMemory,
+            nodeCount: 0
+        };
+        memoryHistory.push(sample);
+        if (memoryHistory.length > MEMORY_HISTORY_CAPACITY) {
+            memoryHistory.shift();
+        }
+        // 泄漏检测采样
+        leakDetectionSamples.push({ time: now, jsHeapUsed: jsHeapUsed, totalMemory: totalMemory });
+        if (leakDetectionSamples.length > LEAK_DETECTION_WINDOW) {
+            leakDetectionSamples.shift();
+        }
+        return sample;
+    }
+    // 内存历史数据接口
+    window.__mcpGetMemoryTimeline = function () {
+        return {
+            history: [...memoryHistory],
+            capacity: MEMORY_HISTORY_CAPACITY
+        };
+    };
+    // 泄漏检测接口：基于线性回归趋势分析
+    window.__mcpDetectMemoryLeak = function () {
+        if (leakDetectionSamples.length < 10) {
+            return { leakDetected: false, confidence: 0, trend: 'insufficient_data', details: '采样数据不足，至少需要 10 个样本' };
+        }
+        // 线性回归分析 jsHeapUsed 趋势
+        const n = leakDetectionSamples.length;
+        const xs = leakDetectionSamples.map((_, i) => i);
+        const ys = leakDetectionSamples.map(s => s.jsHeapUsed);
+        const sumX = xs.reduce((s, v) => s + v, 0);
+        const sumY = ys.reduce((s, v) => s + v, 0);
+        const sumXY = xs.reduce((s, x, i) => s + x * ys[i], 0);
+        const sumX2 = xs.reduce((s, v) => s + v * v, 0);
+        const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+        const intercept = (sumY - slope * sumX) / n;
+        // 计算 R² 决定系数（拟合度）
+        const meanY = sumY / n;
+        const ssTotal = ys.reduce((s, v) => s + (v - meanY) * (v - meanY), 0);
+        const ssResidual = ys.reduce((s, y, i) => {
+            const predicted = slope * xs[i] + intercept;
+            return s + (y - predicted) * (y - predicted);
+        }, 0);
+        const rSquared = 1 - (ssResidual / ssTotal);
+        // 判断是否存在泄漏
+        // 条件：斜率持续为正（内存持续增长）且拟合度高
+        const slopeKB = slope / 1024; // 转换为 KB/样本
+        const isLeakDetected = slope > 1024 && rSquared > 0.7; // 斜率 > 1KB/样本 且 R² > 0.7
+        // 趋势分类
+        let trend = 'stable';
+        if (Math.abs(slopeKB) > 10) {
+            trend = slopeKB > 0 ? 'increasing' : 'decreasing';
+        }
+        // 预测未来内存使用
+        const futurePredictedMB = (slope * n * 30 + intercept) / 1024 / 1024; // 30 个样本后
+        return {
+            leakDetected: isLeakDetected,
+            confidence: Math.min(Math.max(rSquared, 0), 1),
+            trend: trend,
+            slopeKBPerSample: Math.round(slopeKB * 100) / 100,
+            rSquared: Math.round(rSquared * 1000) / 1000,
+            futurePredictedMB: Math.round(futurePredictedMB * 100) / 100,
+            sampleCount: n,
+            details: isLeakDetected
+                ? `检测到潜在内存泄漏：每采样周期增长 ${slopeKB.toFixed(2)} KB，趋势拟合度 ${(rSquared * 100).toFixed(1)}%`
+                : `内存趋势稳定，增长率 ${slopeKB.toFixed(2)} KB/样本`
+        };
+    };
+    // 手动设置泄漏检测基线
+    window.__mcpSetLeakBaseline = function () {
+        leakDetectionBaseline = sampleMemory();
+        leakDetectionSamples = []; // 重置采样窗口
+        return { success: true, baseline: leakDetectionBaseline };
+    };
+    // 定时采样内存数据（每 2 秒）
+    setInterval(() => {
+        sampleMemory();
+    }, 2000);
+    // 立即采样一次
+    sampleMemory();
+}
+//# sourceMappingURL=profiler.js.map

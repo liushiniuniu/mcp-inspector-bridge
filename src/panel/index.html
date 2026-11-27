@@ -1011,8 +1011,8 @@
         </div>
 
         <!-- 游戏 Webview 容器底板 (深渊灰色，负责居中缩放) -->
-        <div id="game-mount-wrap" ref="wrapMount"
-            style="flex: 1; background: #1a1a1c; display: flex; justify-content: center; align-items: center; overflow: hidden; position: relative;">
+        <div id="game-mount-wrap" ref="wrapMount" tabindex="-1" title="点击空白处后按 R 可刷新游戏视图"
+            style="flex: 1; background: #1a1a1c; display: flex; justify-content: center; align-items: center; overflow: hidden; position: relative; outline: none;">
 
             <!-- 被严格限制特定分辨率比例的物理容器 -->
             <div :style="gameContainerStyle"
@@ -1158,6 +1158,95 @@
                     animation: isRecording ? 'blink-record 1s infinite alternate' : 'none'
                 }">
                 {{ isRecording ? '⏹' : '📹' }}
+            </div>
+
+            <!-- 账号自动登录：入口按钮排在录屏按钮下方；面板是 bridge 自己的 DOM，
+                 不受 webview 设备帧 transform: scale(k) 和浏览器整页缩放影响 -->
+            <div @click="accountTogglePanel"
+                :title="'账号自动登录 · ' + (accountData.activeKey ? '已开启自动登录' : '点击展开')"
+                :style="{
+                    position: 'absolute', top: '82px', right: '6px', zIndex: 100,
+                    background: accountData.activeKey ? 'rgba(34,197,94,0.85)' : 'rgba(30,30,30,0.8)',
+                    border: '1px solid rgba(255,255,255,0.1)', borderRadius: '4px',
+                    width: '32px', height: '32px', display: 'flex', alignItems: 'center',
+                    justifyContent: 'center', cursor: 'pointer', userSelect: 'none',
+                    fontSize: '16px', lineHeight: '1', transition: 'background 0.15s'
+                }">
+                👤
+            </div>
+
+            <div v-if="globalState.accountLogin.open" @wheel.stop
+                style="position: absolute; top: 120px; right: 6px; z-index: 102;
+                       width: 300px; max-height: calc(100% - 132px);
+                       display: flex; flex-direction: column;
+                       background: rgba(20,22,28,0.96); color: #e8eaed;
+                       border: 1px solid rgba(255,255,255,0.14); border-radius: 6px;
+                       box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+                       font-size: 12px; line-height: 1.4; overflow: hidden;">
+
+                <!-- 标题栏：状态灯 · 账号 · 数量 · 记录 · 关闭 -->
+                <div style="display: flex; align-items: center; gap: 6px; padding: 6px 8px; background: rgba(255,255,255,0.06); flex: none;">
+                    <span :title="accountStatusTip"
+                        :style="{ width: '8px', height: '8px', borderRadius: '50%', flex: 'none', background: accountStatusColor }"></span>
+                    <span style="flex: 1; font-weight: 600; white-space: nowrap;">账号</span>
+                    <span style="min-width: 18px; padding: 0 5px; border-radius: 9px; background: rgba(255,255,255,0.14); font-size: 11px; line-height: 18px; text-align: center;">{{ accountAccounts.length }}</span>
+                    <button type="button" style="flex: none; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: #c7cbd1; font-size: 13px; line-height: 18px; cursor: pointer;"
+                        title="立即记录当前打开面板里的内容" @click.stop="accountGrab()">＋</button>
+                    <button type="button" style="flex: none; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: #c7cbd1; font-size: 12px; line-height: 18px; cursor: pointer;"
+                        title="收起" @click.stop="accountTogglePanel()">✕</button>
+                </div>
+
+                <!-- 测试服假支付 -->
+                <label :style="{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 10px', flex: 'none', borderTop: '1px solid rgba(255,255,255,0.07)', opacity: accountData.wxPayAvailable ? 1 : 0.5 }"
+                    :title="accountData.wxPayAvailable ? '开启后游戏内购买走测试服假支付（devServerWXPay）' : '等待游戏引擎就绪（需要拿到 DevConfigController）'">
+                    <span style="flex: 1; color: #cfd4da; white-space: nowrap;">测试服假支付</span>
+                    <span v-if="!accountData.wxPayAvailable" style="flex: none; color: #8e939b; font-size: 11px;">未就绪</span>
+                    <input type="checkbox" :checked="accountData.devServerWXPay" :disabled="!accountData.wxPayAvailable"
+                        @change="accountToggleWXPay($event.target.checked)" style="cursor: pointer;" />
+                </label>
+
+                <!-- 一键开新号 -->
+                <div style="display: flex; align-items: center; gap: 6px; padding: 4px 10px 8px; flex: none;"
+                    :title="accountData.newAccount ? '新号创建中：' + accountData.newAccount.deviceId : '读取当前账号，末位数字 +1 作为新号，刷新后自动填入并登录'">
+                    <span :style="{ flex: 1, whiteSpace: 'nowrap', color: accountData.newAccount ? '#93c5fd' : '#cfd4da' }">{{ accountData.newAccount ? '新号创建中' : '一键开新号' }}</span>
+                    <input type="text" inputmode="numeric" maxlength="9" :value="accountData.newTemplate"
+                        :disabled="!!accountData.newAccount" title="模板号：创建后 GM uplv 升到的等级"
+                        @change="accountSetTemplate($event.target.value)"
+                        style="flex: none; width: 38px; padding: 2px 4px; border: 1px solid rgba(255,255,255,0.18); border-radius: 4px; background: rgba(0,0,0,0.35); color: #fff; font: inherit; text-align: center;" />
+                    <button type="button" :disabled="!!accountData.newAccount" @click.stop="accountStartNew()"
+                        style="flex: none; padding: 2px 8px; border: 1px solid rgba(59,130,246,0.65); border-radius: 4px; background: rgba(59,130,246,0.24); color: #fff; font: inherit; cursor: pointer;">{{ accountData.newAccount ? '…' : '开始' }}</button>
+                    <button v-if="accountData.newAccount" type="button" @click.stop="accountCancelNew()"
+                        style="flex: none; padding: 2px 6px; border: 1px solid rgba(255,255,255,0.2); border-radius: 4px; background: transparent; color: #c7cbd1; font: inherit; cursor: pointer;">取消</button>
+                </div>
+
+                <!-- 账号列表 -->
+                <div style="overflow-y: auto; overflow-x: hidden; flex: 1 1 auto; min-height: 0;">
+                    <div v-for="item in accountAccounts" :key="item.key" @click="accountUse(item.key)"
+                        :title="'Device ID: ' + item.deviceId + '\n服务器: ' + item.serverId + '\n线路: ' + (item.host || '未记录') + '\n使用次数: ' + item.useCount"
+                        :style="{
+                            display: 'flex', alignItems: 'center', gap: '6px', padding: '6px 8px',
+                            borderTop: '1px solid rgba(255,255,255,0.07)', cursor: 'pointer',
+                            background: item.key === accountData.activeKey ? 'rgba(59,130,246,0.2)' : 'transparent'
+                        }">
+                        <button type="button" @click.stop="accountRemove(item.key)" title="删除"
+                            style="flex: none; width: 18px; height: 18px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: #8e939b; font-size: 12px; line-height: 18px; cursor: pointer;">✕</button>
+                        <div style="flex: 1; min-width: 0;">
+                            <div style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #fff;">{{ accountShort(item.deviceId) }}</div>
+                            <div style="color: #9aa0a6; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
+                                服务器 {{ item.serverId }}<span v-if="item.host"> · {{ item.host }}</span> · {{ accountTime(item.lastUseAt) }}
+                            </div>
+                        </div>
+                        <input type="checkbox" :checked="item.key === accountData.activeKey" @click.stop
+                            @change="accountToggleAuto(item.key, $event.target.checked)"
+                            title="开启后刷新页面自动登录（同一时间只有一条）" style="flex: none; cursor: pointer;" />
+                    </div>
+                    <div v-if="!accountAccounts.length" style="padding: 12px 10px; color: #8e939b; font-size: 11px; line-height: 1.6; text-align: center;">
+                        暂无账号记录<br />在游戏里点「登录」后自动收集
+                    </div>
+                </div>
+
+                <!-- 提示条 -->
+                <div v-if="accountToast" style="flex: none; padding: 6px 10px; border-top: 1px solid rgba(255,255,255,0.07); color: #93c5fd; word-break: break-word;">{{ accountToast }}</div>
             </div>
         </div>
     </div>
